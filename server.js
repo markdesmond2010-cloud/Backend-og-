@@ -10,7 +10,7 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
-const sqlite3 = require('sqlite3').verbose();
+const db = require('./db');
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 require('dotenv').config();
@@ -28,12 +28,6 @@ const CLOUDINARY_API = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_NAME = process.env.CLOUDINARY_NAME;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-
-// Database setup
-const db = new sqlite3.Database(process.env.DATABASE_PATH || 'duel.db', (err) => {
-  if (err) console.error(err);
-  else console.log('✅ Connected to database');
-});
 
 // Initialize database tables
 function initializeDatabase() {
