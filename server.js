@@ -101,6 +101,9 @@ function initializeDatabase() {
       )
     `);
 
+    // Invite tracking (adds the column to existing databases; error ignored if it already exists)
+    db.run(`ALTER TABLE users ADD COLUMN invitedBy TEXT`, [], () => {});
+
     console.log('✅ Database tables initialized');
   });
 }
@@ -155,6 +158,14 @@ function deletePhotoCompletely(photoId, cb) {
   db.run(`DELETE FROM photos WHERE id = ?`, [photoId], cb);
 }
 
+// Find the user who invited someone (ref = their username)
+function resolveReferrer(ref, cb) {
+  if (!ref || typeof ref !== 'string') return cb(null);
+  db.get(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [ref.trim()], (err, row) => {
+    cb(!err && row ? row.id : null);
+  });
+}
+
 // A photo with this many open reports is hidden until an admin reviews it
 const HIDE_AFTER_REPORTS = 3;
 
@@ -162,7 +173,7 @@ const HIDE_AFTER_REPORTS = 3;
 
 // Sign up with email/password
 app.post('/api/auth/signup', async (req, res) => {
-  const { email, password, username, displayName } = req.body;
+  const { email, password, username, displayName, ref } = req.body;
 
   if (!email || !password || !username || !displayName) {
     return res.status(400).json({ error: 'All fields required' });
@@ -184,6 +195,12 @@ app.post('/api/auth/signup', async (req, res) => {
           }
           return res.status(500).json({ error: 'Signup failed' });
         }
+
+        resolveReferrer(ref, (referrerId) => {
+          if (referrerId && referrerId !== userId) {
+            db.run(`UPDATE users SET invitedBy = ? WHERE id = ?`, [referrerId, userId]);
+          }
+        });
 
         const token = generateToken(userId);
         res.json({
@@ -259,7 +276,7 @@ app.get('/api/auth/google-url', (req, res) => {
 
 // Google OAuth - Handle callback
 app.post('/api/auth/google-callback', async (req, res) => {
-  const { code } = req.body;
+  const { code, ref } = req.body;
 
   try {
     // Exchange code for token
@@ -312,6 +329,12 @@ app.post('/api/auth/google-callback', async (req, res) => {
           (err) => {
             if (err) return res.status(500).json({ error: 'Failed to create user' });
 
+            resolveReferrer(ref, (referrerId) => {
+              if (referrerId && referrerId !== userId) {
+                db.run(`UPDATE users SET invitedBy = ? WHERE id = ?`, [referrerId, userId]);
+              }
+            });
+
             const token = generateToken(userId);
             res.json({
               token,
@@ -341,7 +364,13 @@ app.get('/api/auth/me', verifyToken, (req, res) => {
     [req.userId],
     (err, user) => {
       if (err || !user) return res.status(404).json({ error: 'User not found' });
-      res.json({ ...user, isAdmin: isAdminEmail(user.email) });
+      db.get(`SELECT COUNT(*) AS n FROM users WHERE invitedBy = ?`, [req.userId], (err2, row) => {
+        res.json({
+          ...user,
+          isAdmin: isAdminEmail(user.email),
+          invitedCount: row?.n || 0
+        });
+      });
     }
   );
 });
@@ -508,6 +537,35 @@ app.post('/api/matchup/vote', verifyToken, (req, res) => {
       );
     });
   });
+});
+
+// Rank info for the shareable ranking card
+app.get('/api/photos/:photoId/rank', (req, res) => {
+  db.get(
+    `SELECT id, title, rating, matchesPlayed, wins, losses FROM photos WHERE id = ?`,
+    [req.params.photoId],
+    (err, photo) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (!photo) return res.status(404).json({ error: 'Photo not found' });
+
+      const visible = `(SELECT COUNT(*) FROM reports r WHERE r.photoId = photos.id AND r.status = 'open') < ${HIDE_AFTER_REPORTS}`;
+
+      db.get(`SELECT COUNT(*) AS total FROM photos WHERE matchesPlayed >= 1 AND ${visible}`, (err2, t) => {
+        if (photo.matchesPlayed < 1) {
+          return res.json({ ...photo, rank: null, total: t?.total || 0 });
+        }
+        db.get(
+          `SELECT COUNT(*) AS better FROM photos
+           WHERE matchesPlayed >= 1 AND ${visible}
+             AND (rating > ? OR (rating = ? AND matchesPlayed > ?))`,
+          [photo.rating, photo.rating, photo.matchesPlayed],
+          (err3, b) => {
+            res.json({ ...photo, rank: (b?.better || 0) + 1, total: t?.total || 0 });
+          }
+        );
+      });
+    }
+  );
 });
 
 // ==================== DELETE / REPORT / ADMIN ====================
