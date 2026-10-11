@@ -568,6 +568,48 @@ app.get('/api/photos/:photoId/rank', (req, res) => {
   );
 });
 
+// Public profile (brief) for sharing: /u/<username>
+app.get('/api/public/profile/:username', (req, res) => {
+  db.get(
+    `SELECT id, username, displayName, profileImage, bio FROM users WHERE LOWER(username) = LOWER(?)`,
+    [req.params.username],
+    (err, u) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (!u) return res.status(404).json({ error: 'Profile not found' });
+
+      db.all(
+        `SELECT p.id, p.title, p.imageUrl, p.rating, p.matchesPlayed, p.wins, p.losses,
+           CASE WHEN p.matchesPlayed >= 1 THEN
+             (SELECT COUNT(*) + 1 FROM photos p2
+              WHERE p2.matchesPlayed >= 1
+                AND (SELECT COUNT(*) FROM reports r2 WHERE r2.photoId = p2.id AND r2.status = 'open') < ${HIDE_AFTER_REPORTS}
+                AND (p2.rating > p.rating OR (p2.rating = p.rating AND p2.matchesPlayed > p.matchesPlayed)))
+           ELSE NULL END AS rank
+         FROM photos p
+         WHERE p.userId = ?
+           AND (SELECT COUNT(*) FROM reports r WHERE r.photoId = p.id AND r.status = 'open') < ${HIDE_AFTER_REPORTS}
+         ORDER BY (p.matchesPlayed > 0) DESC, p.rating DESC, p.matchesPlayed DESC`,
+        [u.id],
+        (err2, photos) => {
+          if (err2) return res.status(500).json({ error: 'Database error' });
+          const list = photos || [];
+          const ranks = list.map((p) => p.rank).filter((r) => r != null);
+          res.json({
+            username: u.username,
+            displayName: u.displayName,
+            profileImage: u.profileImage,
+            bio: u.bio,
+            photoCount: list.length,
+            totalVotes: list.reduce((sum, p) => sum + (p.matchesPlayed || 0), 0),
+            bestRank: ranks.length ? Math.min(...ranks) : null,
+            photos: list.slice(0, 3)
+          });
+        }
+      );
+    }
+  );
+});
+
 // ==================== DELETE / REPORT / ADMIN ====================
 
 // Delete my own photo
