@@ -88,6 +88,19 @@ function initializeDatabase() {
       )
     `);
 
+    // Reports table (users flag photos; admin reviews them)
+    db.run(`
+      CREATE TABLE IF NOT EXISTS reports (
+        id TEXT PRIMARY KEY,
+        photoId TEXT NOT NULL,
+        reporterId TEXT NOT NULL,
+        reason TEXT,
+        status TEXT DEFAULT 'open',
+        createdAt INTEGER,
+        UNIQUE(photoId, reporterId)
+      )
+    `);
+
     console.log('✅ Database tables initialized');
   });
 }
@@ -114,6 +127,36 @@ function verifyToken(req, res, next) {
     res.status(401).json({ error: 'Invalid token' });
   }
 }
+
+// Admin emails (comma separated in ADMIN_EMAILS env variable)
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
+  .split(',')
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean);
+
+function isAdminEmail(email) {
+  return !!email && ADMIN_EMAILS.includes(String(email).toLowerCase());
+}
+
+// Admin-only middleware (use after verifyToken)
+function requireAdmin(req, res, next) {
+  db.get(`SELECT email FROM users WHERE id = ?`, [req.userId], (err, user) => {
+    if (err || !user || !isAdminEmail(user.email)) {
+      return res.status(403).json({ error: 'Admins only' });
+    }
+    next();
+  });
+}
+
+// Remove a photo and everything attached to it
+function deletePhotoCompletely(photoId, cb) {
+  db.run(`DELETE FROM matches WHERE photoAId = ? OR photoBId = ? OR winnerId = ?`, [photoId, photoId, photoId]);
+  db.run(`DELETE FROM reports WHERE photoId = ?`, [photoId]);
+  db.run(`DELETE FROM photos WHERE id = ?`, [photoId], cb);
+}
+
+// A photo with this many open reports is hidden until an admin reviews it
+const HIDE_AFTER_REPORTS = 3;
 
 // ==================== AUTH ENDPOINTS ====================
 
@@ -298,7 +341,7 @@ app.get('/api/auth/me', verifyToken, (req, res) => {
     [req.userId],
     (err, user) => {
       if (err || !user) return res.status(404).json({ error: 'User not found' });
-      res.json(user);
+      res.json({ ...user, isAdmin: isAdminEmail(user.email) });
     }
   );
 });
@@ -350,31 +393,48 @@ app.get('/api/users/:userId/photos', (req, res) => {
   );
 });
 
-// Get next matchup
 app.get('/api/matchup/next', verifyToken, (req, res) => {
+  // Photos from other people, not hidden by reports, not reported by this user
   db.all(
-    `SELECT * FROM photos WHERE matchesPlayed >= 0 ORDER BY RANDOM() LIMIT 2`,
+    `SELECT p.*, u.displayName AS uploaderName, u.profileImage AS uploaderImage
+     FROM photos p
+     JOIN users u ON u.id = p.userId
+     WHERE p.userId != ?
+       AND (SELECT COUNT(*) FROM reports r WHERE r.photoId = p.id AND r.status = 'open') < ?
+       AND NOT EXISTS (SELECT 1 FROM reports r2 WHERE r2.photoId = p.id AND r2.reporterId = ?)
+     ORDER BY RANDOM()
+     LIMIT 60`,
+    [req.userId, HIDE_AFTER_REPORTS, req.userId],
     (err, photos) => {
-      if (err || photos.length < 2) {
-        return res.status(400).json({ error: 'Not enough photos' });
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (!photos || photos.length < 2) {
+        return res.status(404).json({ error: 'Not enough photos', code: 'NOT_ENOUGH_PHOTOS' });
       }
 
-      db.get(
-        `SELECT displayName, profileImage FROM users WHERE id = ?`,
-        [photos[0].userId],
-        (err1, user1) => {
-          db.get(
-            `SELECT displayName, profileImage FROM users WHERE id = ?`,
-            [photos[1].userId],
-            (err2, user2) => {
-              res.json({
-                photoA: { ...photos[0], uploader: user1 },
-                photoB: { ...photos[1], uploader: user2 }
-              });
-            }
-          );
+      // Pairs this user has already voted on
+      db.all(`SELECT photoAId, photoBId FROM matches WHERE userId = ?`, [req.userId], (err2, seenRows) => {
+        if (err2) return res.status(500).json({ error: 'Database error' });
+
+        const seen = new Set((seenRows || []).map((m) => [m.photoAId, m.photoBId].sort().join('|')));
+        const pairs = [];
+        for (let i = 0; i < photos.length; i++) {
+          for (let j = i + 1; j < photos.length; j++) {
+            const key = [photos[i].id, photos[j].id].sort().join('|');
+            if (!seen.has(key)) pairs.push([photos[i], photos[j]]);
+          }
         }
-      );
+
+        if (pairs.length === 0) {
+          return res.status(404).json({ error: 'No new pairs', code: 'ALL_VOTED' });
+        }
+
+        const [a, b] = pairs[Math.floor(Math.random() * pairs.length)];
+        const shape = (p) => {
+          const { uploaderName, uploaderImage, ...photo } = p;
+          return { ...photo, uploader: { displayName: uploaderName, profileImage: uploaderImage } };
+        };
+        res.json({ photoA: shape(a), photoB: shape(b) });
+      });
     }
   );
 });
@@ -386,50 +446,146 @@ app.post('/api/matchup/vote', verifyToken, (req, res) => {
   if (!photoAId || !photoBId || !winnerId) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
+  if (winnerId !== photoAId && winnerId !== photoBId) {
+    return res.status(400).json({ error: 'Winner must be one of the two photos' });
+  }
 
   db.get(`SELECT * FROM photos WHERE id = ?`, [photoAId], (err, photoA) => {
-    db.get(`SELECT * FROM photos WHERE id = ?`, [photoBId], (err, photoB) => {
+    db.get(`SELECT * FROM photos WHERE id = ?`, [photoBId], (err2, photoB) => {
       if (!photoA || !photoB) {
         return res.status(400).json({ error: 'Photos not found' });
       }
+      if (photoA.userId === req.userId || photoB.userId === req.userId) {
+        return res.status(403).json({ error: 'You cannot vote on your own photos' });
+      }
 
-      // Calculate Elo changes
-      const ea = 1 / (1 + Math.pow(10, (photoB.rating - photoA.rating) / 400));
-      const eb = 1 - ea;
-      const k = 20;
-      const resultA = winnerId === photoAId ? 1 : 0;
-      const deltaA = k * (resultA - ea);
-      const deltaB = k * ((1 - resultA) - eb);
+      db.get(
+        `SELECT id FROM matches WHERE userId = ?
+           AND ((photoAId = ? AND photoBId = ?) OR (photoAId = ? AND photoBId = ?))`,
+        [req.userId, photoAId, photoBId, photoBId, photoAId],
+        (err3, already) => {
+          if (already) {
+            return res.status(409).json({ error: 'You already voted on this pair' });
+          }
 
-      const newRatingA = photoA.rating + deltaA;
-      const newRatingB = photoB.rating + deltaB;
-      const now = Date.now();
-      const matchId = uuidv4();
+          // Calculate Elo changes
+          const ea = 1 / (1 + Math.pow(10, (photoB.rating - photoA.rating) / 400));
+          const eb = 1 - ea;
+          const k = 20;
+          const resultA = winnerId === photoAId ? 1 : 0;
+          const deltaA = k * (resultA - ea);
+          const deltaB = k * ((1 - resultA) - eb);
 
-      // Update ratings
-      db.run(`UPDATE photos SET rating = ?, matchesPlayed = matchesPlayed + 1, wins = wins + ?, losses = losses + ?, updatedAt = ? WHERE id = ?`,
-        [newRatingA, resultA ? 1 : 0, resultA ? 0 : 1, now, photoAId]);
-      
-      db.run(`UPDATE photos SET rating = ?, matchesPlayed = matchesPlayed + 1, wins = wins + ?, losses = losses + ?, updatedAt = ? WHERE id = ?`,
-        [newRatingB, resultA ? 0 : 1, resultA ? 1 : 0, now, photoBId]);
+          const newRatingA = photoA.rating + deltaA;
+          const newRatingB = photoB.rating + deltaB;
+          const now = Date.now();
+          const matchId = uuidv4();
 
-      // Record match
-      db.run(
-        `INSERT INTO matches (id, photoAId, photoBId, winnerId, userId, ratingABefore, ratingBBefore, ratingAAfter, ratingBAfter, deltaA, deltaB, timestamp)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [matchId, photoAId, photoBId, winnerId, req.userId, photoA.rating, photoB.rating, newRatingA, newRatingB, deltaA, deltaB, now],
-        (err) => {
-          if (err) return res.status(500).json({ error: 'Vote failed' });
+          // Update ratings
+          db.run(`UPDATE photos SET rating = ?, matchesPlayed = matchesPlayed + 1, wins = wins + ?, losses = losses + ?, updatedAt = ? WHERE id = ?`,
+            [newRatingA, resultA ? 1 : 0, resultA ? 0 : 1, now, photoAId]);
 
-          res.json({
-            matchId,
-            winner: winnerId,
-            photoARating: Math.round(newRatingA),
-            photoBRating: Math.round(newRatingB)
-          });
+          db.run(`UPDATE photos SET rating = ?, matchesPlayed = matchesPlayed + 1, wins = wins + ?, losses = losses + ?, updatedAt = ? WHERE id = ?`,
+            [newRatingB, resultA ? 0 : 1, resultA ? 1 : 0, now, photoBId]);
+
+          // Record match
+          db.run(
+            `INSERT INTO matches (id, photoAId, photoBId, winnerId, userId, ratingABefore, ratingBBefore, ratingAAfter, ratingBAfter, deltaA, deltaB, timestamp)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [matchId, photoAId, photoBId, winnerId, req.userId, photoA.rating, photoB.rating, newRatingA, newRatingB, deltaA, deltaB, now],
+            (err4) => {
+              if (err4) return res.status(500).json({ error: 'Vote failed' });
+
+              res.json({
+                matchId,
+                winner: winnerId,
+                photoARating: Math.round(newRatingA),
+                photoBRating: Math.round(newRatingB)
+              });
+            }
+          );
         }
       );
     });
+  });
+});
+
+// ==================== DELETE / REPORT / ADMIN ====================
+
+// Delete my own photo
+app.delete('/api/photos/:photoId', verifyToken, (req, res) => {
+  db.get(`SELECT id, userId FROM photos WHERE id = ?`, [req.params.photoId], (err, photo) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!photo) return res.status(404).json({ error: 'Photo not found' });
+    if (photo.userId !== req.userId) return res.status(403).json({ error: 'Not your photo' });
+
+    deletePhotoCompletely(photo.id, (err2) => {
+      if (err2) return res.status(500).json({ error: 'Delete failed' });
+      res.json({ success: true });
+    });
+  });
+});
+
+// Report a photo
+app.post('/api/photos/:photoId/report', verifyToken, (req, res) => {
+  const reason = String(req.body.reason || 'Other').slice(0, 200);
+
+  db.get(`SELECT id, userId FROM photos WHERE id = ?`, [req.params.photoId], (err, photo) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!photo) return res.status(404).json({ error: 'Photo not found' });
+    if (photo.userId === req.userId) return res.status(400).json({ error: 'You cannot report your own photo' });
+
+    db.run(
+      `INSERT INTO reports (id, photoId, reporterId, reason, status, createdAt) VALUES (?, ?, ?, ?, 'open', ?)`,
+      [uuidv4(), photo.id, req.userId, reason, Date.now()],
+      (err2) => {
+        if (err2 && !String(err2.message).includes('UNIQUE')) {
+          return res.status(500).json({ error: 'Report failed' });
+        }
+        res.json({ success: true });
+      }
+    );
+  });
+});
+
+// Admin: list photos with open reports
+app.get('/api/admin/reports', verifyToken, requireAdmin, (req, res) => {
+  db.all(
+    `SELECT p.id AS photoId, p.title, p.imageUrl, u.displayName AS uploaderName, u.email AS uploaderEmail,
+            COUNT(r.id) AS reportCount
+     FROM reports r
+     JOIN photos p ON p.id = r.photoId
+     JOIN users u ON u.id = p.userId
+     WHERE r.status = 'open'
+     GROUP BY p.id
+     ORDER BY reportCount DESC`,
+    (err, items) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      db.all(`SELECT photoId, reason FROM reports WHERE status = 'open'`, (err2, reasons) => {
+        if (err2) return res.status(500).json({ error: 'Database error' });
+        const out = (items || []).map((it) => ({
+          ...it,
+          reasons: (reasons || []).filter((r) => r.photoId === it.photoId).map((r) => r.reason)
+        }));
+        res.json(out);
+      });
+    }
+  );
+});
+
+// Admin: dismiss reports on a photo (keeps the photo)
+app.post('/api/admin/reports/:photoId/dismiss', verifyToken, requireAdmin, (req, res) => {
+  db.run(`UPDATE reports SET status = 'dismissed' WHERE photoId = ? AND status = 'open'`, [req.params.photoId], (err) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ success: true });
+  });
+});
+
+// Admin: remove any photo
+app.delete('/api/admin/photos/:photoId', verifyToken, requireAdmin, (req, res) => {
+  deletePhotoCompletely(req.params.photoId, (err) => {
+    if (err) return res.status(500).json({ error: 'Delete failed' });
+    res.json({ success: true });
   });
 });
 
@@ -441,6 +597,7 @@ app.get('/api/leaderboard', (req, res) => {
      FROM photos p 
      JOIN users u ON p.userId = u.id 
      WHERE p.matchesPlayed >= 1 
+       AND (SELECT COUNT(*) FROM reports r WHERE r.photoId = p.id AND r.status = 'open') < ${HIDE_AFTER_REPORTS} 
      ORDER BY p.rating DESC, p.matchesPlayed DESC 
      LIMIT 100`,
     (err, photos) => {
