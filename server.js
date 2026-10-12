@@ -201,6 +201,110 @@ function tooManyVotes(userId) {
   return false;
 }
 
+// ---- Tiers, achievements and card labels ----
+// Tiers are based on a user's total wins (votes received on their photos)
+const TIERS = [
+  { name: 'Beginner', emoji: '🌱', min: 0 },
+  { name: 'Contender', emoji: '⚔️', min: 5 },
+  { name: 'Challenger', emoji: '🥈', min: 25 },
+  { name: 'Elite', emoji: '💎', min: 100 },
+  { name: 'Champion', emoji: '👑', min: 300 }
+];
+
+function tierFor(wins) {
+  let idx = 0;
+  TIERS.forEach((t, i) => {
+    if (wins >= t.min) idx = i;
+  });
+  const cur = TIERS[idx];
+  const next = TIERS[idx + 1] || null;
+  return {
+    name: cur.name,
+    emoji: cur.emoji,
+    min: cur.min,
+    nextName: next ? next.name : null,
+    nextMin: next ? next.min : null,
+    wins
+  };
+}
+
+// Everything achievements and tiers need to know about a user
+function userStats(userId, cb) {
+  db.all(`SELECT id, wins, matchesPlayed FROM photos WHERE userId = ?`, [userId], (e1, photos) => {
+    const list = photos || [];
+    const wins = list.reduce((sum, p) => sum + (p.wins || 0), 0);
+    const battles = list.reduce((sum, p) => sum + (p.matchesPlayed || 0), 0);
+
+    db.get(`SELECT COUNT(*) AS n FROM matches WHERE userId = ?`, [userId], (e2, v) => {
+      db.all(
+        `SELECT m.winnerId AS winnerId, p.id AS pid
+         FROM matches m JOIN photos p ON (p.id = m.photoAId OR p.id = m.photoBId)
+         WHERE p.userId = ? ORDER BY m.timestamp ASC`,
+        [userId],
+        (e3, rows) => {
+          let run = 0;
+          let best = 0;
+          (rows || []).forEach((r) => {
+            if (r.winnerId === r.pid) {
+              run += 1;
+              if (run > best) best = run;
+            } else {
+              run = 0;
+            }
+          });
+
+          db.all(
+            `SELECT (SELECT COUNT(*) + 1 FROM photos p2
+                     WHERE p2.matchesPlayed >= 1
+                       AND (p2.rating > p.rating OR (p2.rating = p.rating AND p2.matchesPlayed > p.matchesPlayed))) AS rank
+             FROM photos p WHERE p.userId = ? AND p.matchesPlayed >= 10`,
+            [userId],
+            (e4, ranked) => {
+              const ranks = (ranked || []).map((r) => r.rank);
+              cb({
+                wins,
+                battles,
+                votesCast: v?.n || 0,
+                bestStreak: best,
+                topRank: ranks.length ? Math.min(...ranks) : null
+              });
+            }
+          );
+        }
+      );
+    });
+  });
+}
+
+function buildAchievements(st) {
+  const defs = [
+    { id: 'first_victory', name: 'First Victory', description: 'Win your first duel', current: st.wins, target: 1 },
+    { id: 'rising_star', name: 'Rising Star', description: 'Win 10 duels', current: st.wins, target: 10 },
+    { id: 'crowd_favourite', name: 'Crowd Favourite', description: 'Receive 100 votes', current: st.wins, target: 100 },
+    { id: 'unstoppable', name: 'Unstoppable', description: 'Win 5 duels in a row', current: st.bestStreak, target: 5 },
+    {
+      id: 'peoples_champion',
+      name: "People's Champion",
+      description: 'Get a photo into the top 3 (needs 10+ battles)',
+      current: st.topRank && st.topRank <= 3 ? 1 : 0,
+      target: 1
+    },
+    { id: 'familiar_face', name: 'Familiar Face', description: 'Vote in 100 duels', current: st.votesCast, target: 100 }
+  ];
+  return defs.map((d) => ({ ...d, current: Math.min(d.current, d.target), earned: d.current >= d.target }));
+}
+
+// Precise label for the share card. "Champion" is only used when the ranking really supports it.
+function cardLabel({ rank, total, matchesPlayed, wins, userWins }) {
+  if (rank === 1 && total >= 10 && matchesPlayed >= 10) return 'DUEL CHAMPION';
+  if (rank && rank <= 3 && total >= 3 && matchesPlayed >= 3) return 'TOP-RATED PHOTO';
+  if (wins >= 10) return 'COMMUNITY FAVOURITE';
+  if (userWins >= 10) return 'RISING STAR';
+  if (userWins === 1) return 'FIRST VICTORY';
+  if (rank) return 'ON THE BOARD';
+  return 'NEW CHALLENGER';
+}
+
 // A photo with this many open reports is hidden until an admin reviews it
 const HIDE_AFTER_REPORTS = 3;
 
@@ -595,7 +699,7 @@ app.post('/api/matchup/vote', verifyToken, (req, res) => {
 // Rank info for the shareable ranking card
 app.get('/api/photos/:photoId/rank', (req, res) => {
   db.get(
-    `SELECT id, title, rating, matchesPlayed, wins, losses FROM photos WHERE id = ?`,
+    `SELECT id, userId, title, rating, matchesPlayed, wins, losses FROM photos WHERE id = ?`,
     [req.params.photoId],
     (err, photo) => {
       if (err) return res.status(500).json({ error: 'Database error' });
@@ -603,22 +707,46 @@ app.get('/api/photos/:photoId/rank', (req, res) => {
 
       const visible = `(SELECT COUNT(*) FROM reports r WHERE r.photoId = photos.id AND r.status = 'open') < ${HIDE_AFTER_REPORTS}`;
 
+      const finish = (rank, total) => {
+        userStats(photo.userId, (st) => {
+          const { userId, ...pub } = photo;
+          res.json({
+            ...pub,
+            rank,
+            total,
+            tier: tierFor(st.wins),
+            userWins: st.wins,
+            label: cardLabel({
+              rank,
+              total,
+              matchesPlayed: photo.matchesPlayed,
+              wins: photo.wins,
+              userWins: st.wins
+            })
+          });
+        });
+      };
+
       db.get(`SELECT COUNT(*) AS total FROM photos WHERE matchesPlayed >= 1 AND ${visible}`, (err2, t) => {
-        if (photo.matchesPlayed < 1) {
-          return res.json({ ...photo, rank: null, total: t?.total || 0 });
-        }
+        const total = t?.total || 0;
+        if (photo.matchesPlayed < 1) return finish(null, total);
         db.get(
           `SELECT COUNT(*) AS better FROM photos
            WHERE matchesPlayed >= 1 AND ${visible}
              AND (rating > ? OR (rating = ? AND matchesPlayed > ?))`,
           [photo.rating, photo.rating, photo.matchesPlayed],
-          (err3, b) => {
-            res.json({ ...photo, rank: (b?.better || 0) + 1, total: t?.total || 0 });
-          }
+          (err3, b) => finish((b?.better || 0) + 1, total)
         );
       });
     }
   );
+});
+
+// My achievements and tier
+app.get('/api/achievements', verifyToken, (req, res) => {
+  userStats(req.userId, (st) => {
+    res.json({ tier: tierFor(st.wins), tiers: TIERS, stats: st, achievements: buildAchievements(st) });
+  });
 });
 
 // Choose one of your own uploaded photos as your profile picture (or clear it)
@@ -670,16 +798,87 @@ app.get('/api/public/profile/:username', (req, res) => {
           if (err2) return res.status(500).json({ error: 'Database error' });
           const list = photos || [];
           const ranks = list.map((p) => p.rank).filter((r) => r != null);
-          res.json({
-            username: u.username,
-            displayName: u.displayName,
-            profileImage: u.profileImage,
-            bio: u.bio,
-            photoCount: list.length,
-            totalVotes: list.reduce((sum, p) => sum + (p.matchesPlayed || 0), 0),
-            bestRank: ranks.length ? Math.min(...ranks) : null,
-            photos: list.slice(0, 3)
+
+          userStats(u.id, (st) => {
+            res.json({
+              username: u.username,
+              displayName: u.displayName,
+              profileImage: u.profileImage,
+              bio: u.bio,
+              photoCount: list.length,
+              totalVotes: list.reduce((sum, p) => sum + (p.matchesPlayed || 0), 0),
+              totalWins: st.wins,
+              totalBattles: st.battles,
+              winRate: st.battles ? Math.round((st.wins / st.battles) * 100) : 0,
+              tier: tierFor(st.wins),
+              achievements: buildAchievements(st).filter((a) => a.earned).map((a) => a.name),
+              bestRank: ranks.length ? Math.min(...ranks) : null,
+              photos: list.slice(0, 3)
+            });
           });
+        }
+      );
+    }
+  );
+});
+
+// Public battle preview for the landing page (no login needed)
+app.get('/api/public/battle', (req, res) => {
+  db.all(
+    `SELECT p.id, p.imageUrl, p.userId, u.username AS uploaderUsername
+     FROM photos p JOIN users u ON u.id = p.userId
+     WHERE (SELECT COUNT(*) FROM reports r WHERE r.photoId = p.id AND r.status = 'open') < ${HIDE_AFTER_REPORTS}
+     ORDER BY RANDOM() LIMIT 30`,
+    (err, photos) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (!photos || photos.length < 2) return res.status(404).json({ code: 'NOT_ENOUGH_PHOTOS' });
+
+      let pair = null;
+      for (let i = 0; i < photos.length && !pair; i++) {
+        for (let j = i + 1; j < photos.length; j++) {
+          if (photos[i].userId !== photos[j].userId) {
+            pair = [photos[i], photos[j]];
+            break;
+          }
+        }
+      }
+      if (!pair) pair = [photos[0], photos[1]];
+
+      const shape = (p) => ({ id: p.id, imageUrl: p.imageUrl, uploader: { username: p.uploaderUsername } });
+      res.json({ photoA: shape(pair[0]), photoB: shape(pair[1]) });
+    }
+  );
+});
+
+// Trending duels: most-voted pairs in the last 14 days
+app.get('/api/public/trending', (req, res) => {
+  const since = Date.now() - 14 * 24 * 60 * 60 * 1000;
+  db.all(
+    `SELECT MIN(photoAId, photoBId) AS a, MAX(photoAId, photoBId) AS b, COUNT(*) AS votes
+     FROM matches WHERE timestamp > ?
+     GROUP BY MIN(photoAId, photoBId), MAX(photoAId, photoBId)
+     ORDER BY votes DESC LIMIT 3`,
+    [since],
+    (err, pairs) => {
+      if (err || !pairs || pairs.length === 0) return res.json([]);
+
+      const ids = [...new Set(pairs.flatMap((p) => [p.a, p.b]))];
+      const marks = ids.map(() => '?').join(',');
+      db.all(
+        `SELECT p.id, p.imageUrl, u.username
+         FROM photos p JOIN users u ON u.id = p.userId
+         WHERE p.id IN (${marks})
+           AND (SELECT COUNT(*) FROM reports r WHERE r.photoId = p.id AND r.status = 'open') < ${HIDE_AFTER_REPORTS}`,
+        ids,
+        (err2, rows) => {
+          const byId = {};
+          (rows || []).forEach((r) => {
+            byId[r.id] = { id: r.id, imageUrl: r.imageUrl, uploader: { username: r.username } };
+          });
+          const out = pairs
+            .filter((p) => byId[p.a] && byId[p.b])
+            .map((p) => ({ votes: p.votes, photoA: byId[p.a], photoB: byId[p.b] }));
+          res.json(out);
         }
       );
     }
@@ -769,7 +968,7 @@ app.delete('/api/admin/photos/:photoId', verifyToken, requireAdmin, (req, res) =
 
 app.get('/api/leaderboard', (req, res) => {
   db.all(
-    `SELECT p.*, u.displayName, u.profileImage 
+    `SELECT p.*, u.displayName, u.profileImage, u.username 
      FROM photos p 
      JOIN users u ON p.userId = u.id 
      WHERE p.matchesPlayed >= 1 
