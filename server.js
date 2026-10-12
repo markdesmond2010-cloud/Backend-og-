@@ -166,6 +166,41 @@ function resolveReferrer(ref, cb) {
   });
 }
 
+// ---- Usernames (used in share links like /u/majormark) ----
+const USERNAME_RE = /^[a-z0-9_]{3,20}$/i;
+const RESERVED_USERNAMES = ['u', 'api', 'auth', 'admin', 'www', 'duel', 'login', 'signup', 'support', 'help', 'privacy', 'terms', 'about', 'root', 'null'];
+
+// Find a free short username from a base (e.g. the part of an email before @)
+function pickUsername(base, cb) {
+  let clean = String(base || '').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 15);
+  if (clean.length < 3) clean = (clean + 'user').slice(0, 15);
+  if (RESERVED_USERNAMES.includes(clean)) clean += '1';
+
+  const attempt = (i) => {
+    const candidate = i === 0 ? clean : clean + Math.floor(Math.random() * (i < 4 ? 100 : 100000));
+    db.get(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [candidate], (err, row) => {
+      if (!err && !row) return cb(candidate);
+      if (i >= 8) return cb(clean + Date.now().toString(36).slice(-5));
+      attempt(i + 1);
+    });
+  };
+  attempt(0);
+}
+
+// Simple vote rate limit: at most 15 votes per 30 seconds per account
+const voteLog = new Map();
+function tooManyVotes(userId) {
+  const now = Date.now();
+  const recent = (voteLog.get(userId) || []).filter((t) => now - t < 30000);
+  if (recent.length >= 15) {
+    voteLog.set(userId, recent);
+    return true;
+  }
+  recent.push(now);
+  voteLog.set(userId, recent);
+  return false;
+}
+
 // A photo with this many open reports is hidden until an admin reviews it
 const HIDE_AFTER_REPORTS = 3;
 
@@ -319,9 +354,9 @@ app.post('/api/auth/google-callback', async (req, res) => {
 
         // Create new user from Google info
         const userId = uuidv4();
-        const username = email.split('@')[0] + Math.random().toString(36).slice(7);
         const now = Date.now();
 
+        pickUsername(email.split('@')[0], (username) => {
         db.run(
           `INSERT INTO users (id, googleId, email, username, displayName, profileImage, createdAt, updatedAt)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -349,6 +384,7 @@ app.post('/api/auth/google-callback', async (req, res) => {
             });
           }
         );
+        });
       }
     );
   } catch (err) {
@@ -425,7 +461,7 @@ app.get('/api/users/:userId/photos', (req, res) => {
 app.get('/api/matchup/next', verifyToken, (req, res) => {
   // Photos from other people, not hidden by reports, not reported by this user
   db.all(
-    `SELECT p.*, u.displayName AS uploaderName, u.profileImage AS uploaderImage
+    `SELECT p.*, u.displayName AS uploaderName, u.username AS uploaderUsername, u.profileImage AS uploaderImage
      FROM photos p
      JOIN users u ON u.id = p.userId
      WHERE p.userId != ?
@@ -459,8 +495,11 @@ app.get('/api/matchup/next', verifyToken, (req, res) => {
 
         const [a, b] = pairs[Math.floor(Math.random() * pairs.length)];
         const shape = (p) => {
-          const { uploaderName, uploaderImage, ...photo } = p;
-          return { ...photo, uploader: { displayName: uploaderName, profileImage: uploaderImage } };
+          const { uploaderName, uploaderUsername, uploaderImage, ...photo } = p;
+          return {
+            ...photo,
+            uploader: { displayName: uploaderName, username: uploaderUsername, profileImage: uploaderImage }
+          };
         };
         res.json({ photoA: shape(a), photoB: shape(b) });
       });
@@ -471,6 +510,10 @@ app.get('/api/matchup/next', verifyToken, (req, res) => {
 // Vote on matchup
 app.post('/api/matchup/vote', verifyToken, (req, res) => {
   const { photoAId, photoBId, winnerId } = req.body;
+
+  if (tooManyVotes(req.userId)) {
+    return res.status(429).json({ error: 'You are voting too fast. Slow down a little.' });
+  }
 
   if (!photoAId || !photoBId || !winnerId) {
     return res.status(400).json({ error: 'Missing required fields' });
@@ -525,12 +568,22 @@ app.post('/api/matchup/vote', verifyToken, (req, res) => {
             (err4) => {
               if (err4) return res.status(500).json({ error: 'Vote failed' });
 
-              res.json({
-                matchId,
-                winner: winnerId,
-                photoARating: Math.round(newRatingA),
-                photoBRating: Math.round(newRatingB)
-              });
+              // How the crowd voted on this exact pair (all users)
+              db.get(
+                `SELECT COUNT(*) AS total, SUM(CASE WHEN winnerId = ? THEN 1 ELSE 0 END) AS winnerVotes
+                 FROM matches
+                 WHERE (photoAId = ? AND photoBId = ?) OR (photoAId = ? AND photoBId = ?)`,
+                [winnerId, photoAId, photoBId, photoBId, photoAId],
+                (err5, pair) => {
+                  res.json({
+                    matchId,
+                    winner: winnerId,
+                    photoARating: Math.round(newRatingA),
+                    photoBRating: Math.round(newRatingB),
+                    pairVotes: { total: pair?.total || 1, winnerVotes: pair?.winnerVotes || 1 }
+                  });
+                }
+              );
             }
           );
         }
@@ -763,15 +816,46 @@ app.get('/api/users/:userId', (req, res) => {
 
 // Update profile (bio, display name)
 app.put('/api/profile', verifyToken, (req, res) => {
-  const { displayName, bio } = req.body;
+  const { displayName, bio, username } = req.body;
   const now = Date.now();
 
-  db.run(
-    `UPDATE users SET displayName = ?, bio = ?, updatedAt = ? WHERE id = ?`,
-    [displayName || '', bio || '', now, req.userId],
-    (err) => {
-      if (err) return res.status(500).json({ error: 'Update failed' });
-      res.json({ success: true });
+  const saveProfile = (newUsername) => {
+    const fields = ['displayName = ?', 'bio = ?', 'updatedAt = ?'];
+    const values = [displayName || '', bio || '', now];
+    if (newUsername) {
+      fields.push('username = ?');
+      values.push(newUsername);
+    }
+    values.push(req.userId);
+
+    db.run(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, values, (err) => {
+      if (err) {
+        if (String(err.message).includes('UNIQUE')) {
+          return res.status(409).json({ error: 'That username is already taken' });
+        }
+        return res.status(500).json({ error: 'Update failed' });
+      }
+      res.json({ success: true, username: newUsername || undefined });
+    });
+  };
+
+  if (!username) return saveProfile(null);
+
+  const wanted = String(username).trim().replace(/^@/, '');
+  if (!USERNAME_RE.test(wanted)) {
+    return res.status(400).json({ error: 'Username must be 3-20 letters, numbers or underscores' });
+  }
+  if (RESERVED_USERNAMES.includes(wanted.toLowerCase())) {
+    return res.status(400).json({ error: 'That username is not available' });
+  }
+
+  db.get(
+    `SELECT id FROM users WHERE LOWER(username) = LOWER(?) AND id != ?`,
+    [wanted, req.userId],
+    (err, taken) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (taken) return res.status(409).json({ error: 'That username is already taken' });
+      saveProfile(wanted);
     }
   );
 });
