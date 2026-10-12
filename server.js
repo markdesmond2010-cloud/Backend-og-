@@ -621,6 +621,29 @@ app.get('/api/photos/:photoId/rank', (req, res) => {
   );
 });
 
+// Choose one of your own uploaded photos as your profile picture (or clear it)
+app.put('/api/profile/picture', verifyToken, (req, res) => {
+  const { photoId } = req.body;
+  const now = Date.now();
+
+  if (!photoId) {
+    return db.run(`UPDATE users SET profileImage = NULL, updatedAt = ? WHERE id = ?`, [now, req.userId], (err) => {
+      if (err) return res.status(500).json({ error: 'Update failed' });
+      res.json({ success: true, profileImage: null });
+    });
+  }
+
+  db.get(`SELECT imageUrl FROM photos WHERE id = ? AND userId = ?`, [photoId, req.userId], (err, photo) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!photo) return res.status(404).json({ error: 'Choose one of your own photos' });
+
+    db.run(`UPDATE users SET profileImage = ?, updatedAt = ? WHERE id = ?`, [photo.imageUrl, now, req.userId], (err2) => {
+      if (err2) return res.status(500).json({ error: 'Update failed' });
+      res.json({ success: true, profileImage: photo.imageUrl });
+    });
+  });
+});
+
 // Public profile (brief) for sharing: /u/<username>
 app.get('/api/public/profile/:username', (req, res) => {
   db.get(
