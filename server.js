@@ -715,7 +715,7 @@ app.get('/api/matchup/next', verifyToken, (req, res) => {
     [req.userId, HIDE_AFTER_REPORTS, req.userId, category, category],
     (err, photos) => {
       if (err) return res.status(500).json({ error: 'Database error' });
-      if (!photos || photos.length < 2) {
+      if (!photos || photos.length < 2 || new Set(photos.map((p) => p.userId)).size < 2) {
         return res.status(404).json({ error: 'Not enough photos', code: 'NOT_ENOUGH_PHOTOS' });
       }
 
@@ -729,7 +729,8 @@ app.get('/api/matchup/next', verifyToken, (req, res) => {
           for (let j = i + 1; j < photos.length; j++) {
             const key = [photos[i].id, photos[j].id].sort().join('|');
             const sameCategory = (photos[i].category || 'selfies') === (photos[j].category || 'selfies');
-            if (sameCategory && !seen.has(key)) pairs.push([photos[i], photos[j]]);
+            const differentOwners = photos[i].userId !== photos[j].userId; // never pit someone against themselves
+            if (sameCategory && differentOwners && !seen.has(key)) pairs.push([photos[i], photos[j]]);
           }
         }
 
@@ -794,6 +795,9 @@ app.post('/api/matchup/vote', verifyToken, (req, res) => {
       }
       if (photoA.userId === req.userId || photoB.userId === req.userId) {
         return res.status(403).json({ error: 'You cannot vote on your own photos' });
+      }
+      if (photoA.userId === photoB.userId) {
+        return res.status(400).json({ error: 'Those photos belong to the same person' });
       }
 
       db.get(
@@ -1018,7 +1022,7 @@ app.get('/api/public/battle', (req, res) => {
           }
         }
       }
-      if (!pair) pair = [photos[0], photos[1]];
+      if (!pair) return res.status(404).json({ code: 'NOT_ENOUGH_PHOTOS' });
 
       const shape = (p) => ({ id: p.id, imageUrl: p.imageUrl, uploader: { username: p.uploaderUsername } });
       res.json({ photoA: shape(pair[0]), photoB: shape(pair[1]) });
@@ -1041,7 +1045,7 @@ app.get('/api/public/trending', (req, res) => {
       const ids = [...new Set(pairs.flatMap((p) => [p.a, p.b]))];
       const marks = ids.map(() => '?').join(',');
       db.all(
-        `SELECT p.id, p.imageUrl, u.username
+        `SELECT p.id, p.imageUrl, p.userId, u.username
          FROM photos p JOIN users u ON u.id = p.userId
          WHERE p.id IN (${marks})
            AND (SELECT COUNT(*) FROM reports r WHERE r.photoId = p.id AND r.status = 'open') < ${HIDE_AFTER_REPORTS}`,
@@ -1049,11 +1053,15 @@ app.get('/api/public/trending', (req, res) => {
         (err2, rows) => {
           const byId = {};
           (rows || []).forEach((r) => {
-            byId[r.id] = { id: r.id, imageUrl: r.imageUrl, uploader: { username: r.username } };
+            byId[r.id] = { id: r.id, userId: r.userId, imageUrl: r.imageUrl, uploader: { username: r.username } };
           });
           const out = pairs
-            .filter((p) => byId[p.a] && byId[p.b])
-            .map((p) => ({ votes: p.votes, photoA: byId[p.a], photoB: byId[p.b] }));
+            .filter((p) => byId[p.a] && byId[p.b] && byId[p.a].userId !== byId[p.b].userId)
+            .map((p) => ({
+              votes: p.votes,
+              photoA: { id: byId[p.a].id, imageUrl: byId[p.a].imageUrl, uploader: byId[p.a].uploader },
+              photoB: { id: byId[p.b].id, imageUrl: byId[p.b].imageUrl, uploader: byId[p.b].uploader }
+            }));
           res.json(out);
         }
       );
