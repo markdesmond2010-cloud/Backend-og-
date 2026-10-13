@@ -16,6 +16,7 @@ const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 5000;
 
 // Middleware
@@ -103,6 +104,23 @@ function initializeDatabase() {
 
     // Invite tracking (adds the column to existing databases; error ignored if it already exists)
     db.run(`ALTER TABLE users ADD COLUMN invitedBy TEXT`, [], () => {});
+    db.run(`ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0`, [], () => {});
+    db.run(`ALTER TABLE photos ADD COLUMN category TEXT DEFAULT 'selfies'`, [], () => {});
+
+    // Challenges: a direct duel between two specific photos
+    db.run(`
+      CREATE TABLE IF NOT EXISTS challenges (
+        id TEXT PRIMARY KEY,
+        fromUserId TEXT NOT NULL,
+        toUserId TEXT NOT NULL,
+        fromPhotoId TEXT NOT NULL,
+        toPhotoId TEXT,
+        status TEXT DEFAULT 'pending',
+        createdAt INTEGER,
+        acceptedAt INTEGER,
+        endsAt INTEGER
+      )
+    `);
 
     console.log('✅ Database tables initialized');
   });
@@ -122,13 +140,18 @@ function verifyToken(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
 
+  let decoded;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.userId = decoded.userId;
-    next();
+    decoded = jwt.verify(token, JWT_SECRET);
   } catch (err) {
-    res.status(401).json({ error: 'Invalid token' });
+    return res.status(401).json({ error: 'Invalid token' });
   }
+
+  req.userId = decoded.userId;
+  db.get(`SELECT banned FROM users WHERE id = ?`, [req.userId], (err, row) => {
+    if (row && row.banned) return res.status(403).json({ error: 'This account has been suspended' });
+    next();
+  });
 }
 
 // Admin emails (comma separated in ADMIN_EMAILS env variable)
@@ -155,6 +178,7 @@ function requireAdmin(req, res, next) {
 function deletePhotoCompletely(photoId, cb) {
   db.run(`DELETE FROM matches WHERE photoAId = ? OR photoBId = ? OR winnerId = ?`, [photoId, photoId, photoId]);
   db.run(`DELETE FROM reports WHERE photoId = ?`, [photoId]);
+  db.run(`UPDATE challenges SET status = 'cancelled' WHERE fromPhotoId = ? OR toPhotoId = ?`, [photoId, photoId]);
   db.run(`DELETE FROM photos WHERE id = ?`, [photoId], cb);
 }
 
@@ -305,13 +329,112 @@ function cardLabel({ rank, total, matchesPlayed, wins, userWins }) {
   return 'NEW CHALLENGER';
 }
 
+// ---- Categories ----
+const CATEGORIES = {
+  fashion: 'Fashion & Outfits',
+  selfies: 'Selfies & Personal Style',
+  photography: 'Photography & Creativity'
+};
+
+// ---- Rate limits (in memory; resets when the server restarts) ----
+function makeLimiter(windowMs, max, message, keyFn) {
+  const hits = new Map();
+  return (req, res, next) => {
+    const key = keyFn ? keyFn(req) : req.ip;
+    const now = Date.now();
+    const recent = (hits.get(key) || []).filter((t) => now - t < windowMs);
+    if (recent.length >= max) {
+      hits.set(key, recent);
+      return res.status(429).json({ error: message });
+    }
+    recent.push(now);
+    hits.set(key, recent);
+    next();
+  };
+}
+const authLimiter = makeLimiter(15 * 60 * 1000, 30, 'Too many attempts. Try again in a few minutes.');
+const signupLimiter = makeLimiter(60 * 60 * 1000, 8, 'Too many sign-ups from this network. Try again later.');
+const uploadLimiter = makeLimiter(10 * 60 * 1000, 6, 'You are uploading too fast. Try again in a few minutes.', (req) => req.userId);
+const challengeLimiter = makeLimiter(60 * 60 * 1000, 10, 'Too many challenges. Try again later.', (req) => req.userId);
+const MAX_PHOTOS_PER_USER = 20;
+
+// ---- Battle tokens: a vote is only accepted for a battle the server actually served ----
+function signMatchToken(userId, a, b) {
+  return jwt.sign({ k: 'match', u: userId, a, b }, JWT_SECRET, { expiresIn: '15m' });
+}
+
+// ---- Small promise wrappers for the analytics queries ----
+const dbGet = (sql, params = []) => new Promise((resolve, reject) => db.get(sql, params, (e, r) => (e ? reject(e) : resolve(r))));
+const dbAll = (sql, params = []) => new Promise((resolve, reject) => db.all(sql, params, (e, r) => (e ? reject(e) : resolve(r || []))));
+
+// ---- Challenges ----
+function challengeRows(whereSql, params, cb) {
+  db.all(
+    `SELECT c.*, fu.username AS fromUsername, fu.displayName AS fromName,
+            tu.username AS toUsername, tu.displayName AS toName,
+            fp.imageUrl AS fromImage, fp.title AS fromTitle,
+            tp.imageUrl AS toImage, tp.title AS toTitle
+     FROM challenges c
+     JOIN users fu ON fu.id = c.fromUserId
+     JOIN users tu ON tu.id = c.toUserId
+     JOIN photos fp ON fp.id = c.fromPhotoId
+     LEFT JOIN photos tp ON tp.id = c.toPhotoId
+     WHERE ${whereSql}
+     ORDER BY c.createdAt DESC LIMIT 30`,
+    params,
+    cb
+  );
+}
+
+function shapeChallenge(r, counts) {
+  const base = {
+    id: r.id,
+    status: r.status,
+    createdAt: r.createdAt,
+    acceptedAt: r.acceptedAt,
+    endsAt: r.endsAt,
+    from: { userId: r.fromUserId, username: r.fromUsername, displayName: r.fromName, photoId: r.fromPhotoId, imageUrl: r.fromImage, title: r.fromTitle },
+    to: { userId: r.toUserId, username: r.toUsername, displayName: r.toName, photoId: r.toPhotoId, imageUrl: r.toImage, title: r.toTitle }
+  };
+  if (!counts) return base;
+  const votesFrom = (counts.find((c) => c.winnerId === r.fromPhotoId) || {}).n || 0;
+  const votesTo = (counts.find((c) => c.winnerId === r.toPhotoId) || {}).n || 0;
+  const ended = Date.now() > r.endsAt;
+  let winner = null;
+  if (ended) winner = votesFrom > votesTo ? 'from' : votesTo > votesFrom ? 'to' : 'tie';
+  return { ...base, votesFrom, votesTo, total: votesFrom + votesTo, ended, winner };
+}
+
+function addBattleCounts(rows, cb) {
+  if (!rows.length) return cb([]);
+  const out = [];
+  let left = rows.length;
+  rows.forEach((r, i) => {
+    if (r.status !== 'accepted') {
+      out[i] = shapeChallenge(r, null);
+      if (--left === 0) cb(out);
+      return;
+    }
+    db.all(
+      `SELECT winnerId, COUNT(*) AS n FROM matches
+       WHERE (photoAId = ? AND photoBId = ?) OR (photoAId = ? AND photoBId = ?)
+       GROUP BY winnerId`,
+      [r.fromPhotoId, r.toPhotoId, r.toPhotoId, r.fromPhotoId],
+      (e, counts) => {
+        out[i] = shapeChallenge(r, counts || []);
+        if (--left === 0) cb(out);
+      }
+    );
+  });
+}
+
 // A photo with this many open reports is hidden until an admin reviews it
 const HIDE_AFTER_REPORTS = 3;
 
 // ==================== AUTH ENDPOINTS ====================
 
 // Sign up with email/password
-app.post('/api/auth/signup', async (req, res) => {
+app.post('/api/auth/signup', authLimiter, signupLimiter, async (req, res) => {
   const { email, password, username, displayName, ref } = req.body;
 
   if (!email || !password || !username || !displayName) {
@@ -361,7 +484,7 @@ app.post('/api/auth/signup', async (req, res) => {
 });
 
 // Login with email/password
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -374,6 +497,9 @@ app.post('/api/auth/login', async (req, res) => {
     async (err, user) => {
       if (err || !user) {
         return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      if (user.banned) {
+        return res.status(403).json({ error: 'This account has been suspended' });
       }
 
       try {
@@ -505,10 +631,13 @@ app.get('/api/auth/me', verifyToken, (req, res) => {
     (err, user) => {
       if (err || !user) return res.status(404).json({ error: 'User not found' });
       db.get(`SELECT COUNT(*) AS n FROM users WHERE invitedBy = ?`, [req.userId], (err2, row) => {
-        res.json({
-          ...user,
-          isAdmin: isAdminEmail(user.email),
-          invitedCount: row?.n || 0
+        db.get(`SELECT COUNT(*) AS n FROM challenges WHERE toUserId = ? AND status = 'pending'`, [req.userId], (err3, ch) => {
+          res.json({
+            ...user,
+            isAdmin: isAdminEmail(user.email),
+            invitedCount: row?.n || 0,
+            pendingChallenges: ch?.n || 0
+          });
         });
       });
     }
@@ -518,41 +647,49 @@ app.get('/api/auth/me', verifyToken, (req, res) => {
 // ==================== PHOTO ENDPOINTS ====================
 
 // Upload photo (to Cloudinary - handled by frontend)
-app.post('/api/photos/upload', verifyToken, (req, res) => {
+app.post('/api/photos/upload', verifyToken, uploadLimiter, (req, res) => {
   const { title, imageUrl, cloudinaryId } = req.body;
+  const category = CATEGORIES[req.body.category] ? req.body.category : 'selfies';
 
   if (!title || !imageUrl) {
     return res.status(400).json({ error: 'Title and image required' });
   }
 
-  const photoId = uuidv4();
-  const now = Date.now();
-
-  db.run(
-    `INSERT INTO photos (id, userId, title, imageUrl, cloudinaryId, createdAt, updatedAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [photoId, req.userId, title, imageUrl, cloudinaryId, now, now],
-    (err) => {
-      if (err) return res.status(500).json({ error: 'Upload failed' });
-
-      res.json({
-        id: photoId,
-        userId: req.userId,
-        title,
-        imageUrl,
-        rating: 1600,
-        matchesPlayed: 0,
-        wins: 0,
-        losses: 0
-      });
+  db.get(`SELECT COUNT(*) AS n FROM photos WHERE userId = ?`, [req.userId], (e, row) => {
+    if (row && row.n >= MAX_PHOTOS_PER_USER) {
+      return res.status(400).json({ error: `You can have up to ${MAX_PHOTOS_PER_USER} photos. Delete one to add another.` });
     }
-  );
+
+    const photoId = uuidv4();
+    const now = Date.now();
+
+    db.run(
+      `INSERT INTO photos (id, userId, title, imageUrl, cloudinaryId, category, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [photoId, req.userId, String(title).slice(0, 100), imageUrl, cloudinaryId, category, now, now],
+      (err) => {
+        if (err) return res.status(500).json({ error: 'Upload failed' });
+
+        res.json({
+          id: photoId,
+          userId: req.userId,
+          title,
+          imageUrl,
+          category,
+          rating: 1600,
+          matchesPlayed: 0,
+          wins: 0,
+          losses: 0
+        });
+      }
+    );
+  });
 });
 
 // Get user's photos
 app.get('/api/users/:userId/photos', (req, res) => {
   db.all(
-    `SELECT id, userId, title, imageUrl, rating, matchesPlayed, wins, losses, createdAt
+    `SELECT id, userId, title, imageUrl, category, rating, matchesPlayed, wins, losses, createdAt
      FROM photos WHERE userId = ? ORDER BY createdAt DESC`,
     [req.params.userId],
     (err, photos) => {
@@ -563,6 +700,7 @@ app.get('/api/users/:userId/photos', (req, res) => {
 });
 
 app.get('/api/matchup/next', verifyToken, (req, res) => {
+  const category = CATEGORIES[req.query.category] ? req.query.category : null;
   // Photos from other people, not hidden by reports, not reported by this user
   db.all(
     `SELECT p.*, u.displayName AS uploaderName, u.username AS uploaderUsername, u.profileImage AS uploaderImage
@@ -571,9 +709,10 @@ app.get('/api/matchup/next', verifyToken, (req, res) => {
      WHERE p.userId != ?
        AND (SELECT COUNT(*) FROM reports r WHERE r.photoId = p.id AND r.status = 'open') < ?
        AND NOT EXISTS (SELECT 1 FROM reports r2 WHERE r2.photoId = p.id AND r2.reporterId = ?)
+       AND (? IS NULL OR COALESCE(p.category, 'selfies') = ?)
      ORDER BY RANDOM()
      LIMIT 60`,
-    [req.userId, HIDE_AFTER_REPORTS, req.userId],
+    [req.userId, HIDE_AFTER_REPORTS, req.userId, category, category],
     (err, photos) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       if (!photos || photos.length < 2) {
@@ -589,7 +728,8 @@ app.get('/api/matchup/next', verifyToken, (req, res) => {
         for (let i = 0; i < photos.length; i++) {
           for (let j = i + 1; j < photos.length; j++) {
             const key = [photos[i].id, photos[j].id].sort().join('|');
-            if (!seen.has(key)) pairs.push([photos[i], photos[j]]);
+            const sameCategory = (photos[i].category || 'selfies') === (photos[j].category || 'selfies');
+            if (sameCategory && !seen.has(key)) pairs.push([photos[i], photos[j]]);
           }
         }
 
@@ -597,7 +737,15 @@ app.get('/api/matchup/next', verifyToken, (req, res) => {
           return res.status(404).json({ error: 'No new pairs', code: 'ALL_VOTED' });
         }
 
-        const [a, b] = pairs[Math.floor(Math.random() * pairs.length)];
+        // New photos get more exposure: pairs with fewer battles are more likely
+        const weights = pairs.map(([x, y]) => 1 / (1 + ((x.matchesPlayed || 0) + (y.matchesPlayed || 0)) / 2));
+        let roll = Math.random() * weights.reduce((sum, w) => sum + w, 0);
+        let pick = 0;
+        for (; pick < weights.length; pick++) {
+          roll -= weights[pick];
+          if (roll <= 0) break;
+        }
+        const [a, b] = pairs[Math.min(pick, pairs.length - 1)];
         const shape = (p) => {
           const { uploaderName, uploaderUsername, uploaderImage, ...photo } = p;
           return {
@@ -605,7 +753,7 @@ app.get('/api/matchup/next', verifyToken, (req, res) => {
             uploader: { displayName: uploaderName, username: uploaderUsername, profileImage: uploaderImage }
           };
         };
-        res.json({ photoA: shape(a), photoB: shape(b) });
+        res.json({ photoA: shape(a), photoB: shape(b), matchToken: signMatchToken(req.userId, a.id, b.id) });
       });
     }
   );
@@ -613,10 +761,23 @@ app.get('/api/matchup/next', verifyToken, (req, res) => {
 
 // Vote on matchup
 app.post('/api/matchup/vote', verifyToken, (req, res) => {
-  const { photoAId, photoBId, winnerId } = req.body;
+  const { photoAId, photoBId, winnerId, matchToken } = req.body;
 
   if (tooManyVotes(req.userId)) {
     return res.status(429).json({ error: 'You are voting too fast. Slow down a little.' });
+  }
+
+  // The battle must be one the server served to this user, and not answered instantly
+  try {
+    const t = jwt.verify(matchToken || '', JWT_SECRET);
+    const sameUser = t.k === 'match' && t.u === req.userId;
+    const samePair = (t.a === photoAId && t.b === photoBId) || (t.a === photoBId && t.b === photoAId);
+    if (!sameUser || !samePair) throw new Error('bad token');
+    if (Date.now() / 1000 - t.iat < 1) {
+      return res.status(429).json({ error: 'That was too quick. Take a look at both photos first!' });
+    }
+  } catch (e) {
+    return res.status(400).json({ error: 'This battle expired. Refresh and try again.' });
   }
 
   if (!photoAId || !photoBId || !winnerId) {
@@ -647,10 +808,12 @@ app.post('/api/matchup/vote', verifyToken, (req, res) => {
           // Calculate Elo changes
           const ea = 1 / (1 + Math.pow(10, (photoB.rating - photoA.rating) / 400));
           const eb = 1 - ea;
-          const k = 20;
+          // New photos move faster so they find their level quickly (fairness for newcomers)
+          const kA = (photoA.matchesPlayed || 0) < 10 ? 40 : 20;
+          const kB = (photoB.matchesPlayed || 0) < 10 ? 40 : 20;
           const resultA = winnerId === photoAId ? 1 : 0;
-          const deltaA = k * (resultA - ea);
-          const deltaB = k * ((1 - resultA) - eb);
+          const deltaA = kA * (resultA - ea);
+          const deltaB = kB * ((1 - resultA) - eb);
 
           const newRatingA = photoA.rating + deltaA;
           const newRatingB = photoB.rating + deltaB;
@@ -699,7 +862,9 @@ app.post('/api/matchup/vote', verifyToken, (req, res) => {
 // Rank info for the shareable ranking card
 app.get('/api/photos/:photoId/rank', (req, res) => {
   db.get(
-    `SELECT id, userId, title, rating, matchesPlayed, wins, losses FROM photos WHERE id = ?`,
+    `SELECT p.id, p.userId, p.title, p.imageUrl, p.category, p.rating, p.matchesPlayed, p.wins, p.losses,
+            u.username AS ownerUsername, u.displayName AS ownerName
+     FROM photos p JOIN users u ON u.id = p.userId WHERE p.id = ?`,
     [req.params.photoId],
     (err, photo) => {
       if (err) return res.status(500).json({ error: 'Database error' });
@@ -885,6 +1050,244 @@ app.get('/api/public/trending', (req, res) => {
   );
 });
 
+// Daily challenge: vote on 10 duels in today's featured category
+app.get('/api/daily', verifyToken, (req, res) => {
+  const day = Math.floor(Date.now() / 86400000);
+  const keys = Object.keys(CATEGORIES);
+  const category = keys[day % keys.length];
+  const goal = 10;
+
+  db.get(
+    `SELECT COUNT(*) AS n FROM matches m JOIN photos p ON p.id = m.winnerId
+     WHERE m.userId = ? AND m.timestamp >= ? AND COALESCE(p.category, 'selfies') = ?`,
+    [req.userId, day * 86400000, category],
+    (err, row) => {
+      db.all(
+        `SELECT DISTINCT CAST(timestamp / 86400000 AS INTEGER) AS d FROM matches
+         WHERE userId = ? AND timestamp >= ? ORDER BY d DESC`,
+        [req.userId, Date.now() - 60 * 86400000],
+        (err2, rows) => {
+          const days = new Set((rows || []).map((r) => r.d));
+          let cursor = days.has(day) ? day : day - 1;
+          let streak = 0;
+          while (days.has(cursor)) {
+            streak += 1;
+            cursor -= 1;
+          }
+          const votes = row?.n || 0;
+          res.json({ category, categoryLabel: CATEGORIES[category], goal, votes, done: votes >= goal, streak });
+        }
+      );
+    }
+  );
+});
+
+// ---- Challenges ----
+app.post('/api/challenges', verifyToken, challengeLimiter, (req, res) => {
+  const { toUsername, photoId } = req.body;
+  if (!toUsername || !photoId) return res.status(400).json({ error: 'Choose a person and one of your photos' });
+
+  db.get(`SELECT id FROM photos WHERE id = ? AND userId = ?`, [photoId, req.userId], (e1, photo) => {
+    if (!photo) return res.status(400).json({ error: 'Choose one of your own photos' });
+
+    db.get(`SELECT id FROM users WHERE LOWER(username) = LOWER(?)`, [String(toUsername).replace(/^@/, '')], (e2, target) => {
+      if (!target) return res.status(404).json({ error: 'We could not find that user' });
+      if (target.id === req.userId) return res.status(400).json({ error: 'You cannot challenge yourself' });
+
+      db.get(
+        `SELECT id FROM challenges WHERE fromUserId = ? AND toUserId = ? AND status = 'pending'`,
+        [req.userId, target.id],
+        (e3, existing) => {
+          if (existing) return res.status(409).json({ error: 'You already sent them a challenge' });
+
+          const id = uuidv4();
+          db.run(
+            `INSERT INTO challenges (id, fromUserId, toUserId, fromPhotoId, status, createdAt) VALUES (?, ?, ?, ?, 'pending', ?)`,
+            [id, req.userId, target.id, photoId, Date.now()],
+            (e4) => {
+              if (e4) return res.status(500).json({ error: 'Could not send the challenge' });
+              res.json({ success: true, id });
+            }
+          );
+        }
+      );
+    });
+  });
+});
+
+app.get('/api/challenges', verifyToken, (req, res) => {
+  db.run(`UPDATE challenges SET status = 'expired' WHERE status = 'pending' AND createdAt < ?`, [Date.now() - 7 * 86400000]);
+  challengeRows(
+    `(c.fromUserId = ? OR c.toUserId = ?) AND c.status NOT IN ('cancelled', 'declined')`,
+    [req.userId, req.userId],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      addBattleCounts(rows || [], (out) => {
+        res.json(out.map((c) => ({ ...c, role: c.from.userId === req.userId ? 'from' : 'to' })));
+      });
+    }
+  );
+});
+
+app.post('/api/challenges/:id/accept', verifyToken, (req, res) => {
+  const { photoId } = req.body;
+  db.get(`SELECT * FROM challenges WHERE id = ?`, [req.params.id], (e1, c) => {
+    if (!c) return res.status(404).json({ error: 'Challenge not found' });
+    if (c.toUserId !== req.userId) return res.status(403).json({ error: 'This challenge is not for you' });
+    if (c.status !== 'pending') return res.status(400).json({ error: 'This challenge is no longer open' });
+
+    db.get(`SELECT id FROM photos WHERE id = ? AND userId = ?`, [photoId, req.userId], (e2, photo) => {
+      if (!photo) return res.status(400).json({ error: 'Choose one of your own photos' });
+      const now = Date.now();
+      db.run(
+        `UPDATE challenges SET toPhotoId = ?, status = 'accepted', acceptedAt = ?, endsAt = ? WHERE id = ?`,
+        [photoId, now, now + 3 * 86400000, c.id],
+        (e3) => {
+          if (e3) return res.status(500).json({ error: 'Could not accept' });
+          res.json({ success: true, id: c.id });
+        }
+      );
+    });
+  });
+});
+
+app.post('/api/challenges/:id/decline', verifyToken, (req, res) => {
+  db.run(
+    `UPDATE challenges SET status = 'declined' WHERE id = ? AND toUserId = ? AND status = 'pending'`,
+    [req.params.id, req.userId],
+    () => res.json({ success: true })
+  );
+});
+
+app.post('/api/challenges/:id/cancel', verifyToken, (req, res) => {
+  db.run(
+    `UPDATE challenges SET status = 'cancelled' WHERE id = ? AND fromUserId = ? AND status = 'pending'`,
+    [req.params.id, req.userId],
+    () => res.json({ success: true })
+  );
+});
+
+// Public battle page data
+app.get('/api/battle/:id', (req, res) => {
+  challengeRows(`c.id = ? AND c.status = 'accepted'`, [req.params.id], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!rows || rows.length === 0) return res.status(404).json({ error: 'Battle not found' });
+    addBattleCounts(rows, (out) => res.json(out[0]));
+  });
+});
+
+// Permission + token to vote in a battle
+app.get('/api/battle/:id/vote-token', verifyToken, (req, res) => {
+  challengeRows(`c.id = ? AND c.status = 'accepted'`, [req.params.id], (err, rows) => {
+    const c = rows && rows[0];
+    if (!c) return res.status(404).json({ error: 'Battle not found' });
+    if (Date.now() > c.endsAt) return res.json({ canVote: false, reason: 'ended' });
+    if (c.fromUserId === req.userId || c.toUserId === req.userId) return res.json({ canVote: false, reason: 'own' });
+
+    db.get(
+      `SELECT id FROM matches WHERE userId = ?
+         AND ((photoAId = ? AND photoBId = ?) OR (photoAId = ? AND photoBId = ?))`,
+      [req.userId, c.fromPhotoId, c.toPhotoId, c.toPhotoId, c.fromPhotoId],
+      (e2, seen) => {
+        if (seen) return res.json({ canVote: false, reason: 'voted' });
+        res.json({
+          canVote: true,
+          photoAId: c.fromPhotoId,
+          photoBId: c.toPhotoId,
+          matchToken: signMatchToken(req.userId, c.fromPhotoId, c.toPhotoId)
+        });
+      }
+    );
+  });
+});
+
+// ---- Admin analytics and moderation ----
+app.get('/api/admin/analytics', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const now = Date.now();
+    const day = 86400000;
+    const week = now - 7 * day;
+
+    const [users, users7, photos, photos7, votes, votes24, votes7, voters7, reports, referred, refTop, daily, boosting, newHeavy] =
+      await Promise.all([
+        dbGet(`SELECT COUNT(*) AS n FROM users`),
+        dbGet(`SELECT COUNT(*) AS n FROM users WHERE createdAt >= ?`, [week]),
+        dbGet(`SELECT COUNT(*) AS n FROM photos`),
+        dbGet(`SELECT COUNT(*) AS n FROM photos WHERE createdAt >= ?`, [week]),
+        dbGet(`SELECT COUNT(*) AS n FROM matches`),
+        dbGet(`SELECT COUNT(*) AS n FROM matches WHERE timestamp >= ?`, [now - day]),
+        dbGet(`SELECT COUNT(*) AS n FROM matches WHERE timestamp >= ?`, [week]),
+        dbGet(`SELECT COUNT(DISTINCT userId) AS n FROM matches WHERE timestamp >= ?`, [week]),
+        dbGet(`SELECT COUNT(DISTINCT photoId) AS n FROM reports WHERE status = 'open'`),
+        dbGet(`SELECT COUNT(*) AS n FROM users WHERE invitedBy IS NOT NULL`),
+        dbAll(`SELECT u.username AS username, COUNT(*) AS n FROM users i JOIN users u ON u.id = i.invitedBy GROUP BY u.id ORDER BY n DESC LIMIT 5`),
+        dbAll(`SELECT CAST(timestamp / 86400000 AS INTEGER) AS d, COUNT(*) AS n FROM matches WHERE timestamp >= ? GROUP BY d ORDER BY d`, [now - 7 * day]),
+        dbAll(
+          `SELECT vu.username AS voter, ou.username AS owner, COUNT(*) AS n
+           FROM matches m
+           JOIN photos p ON p.id = m.winnerId
+           JOIN users ou ON ou.id = p.userId
+           JOIN users vu ON vu.id = m.userId
+           WHERE m.timestamp >= ?
+           GROUP BY m.userId, p.userId HAVING COUNT(*) >= 15 ORDER BY n DESC LIMIT 10`,
+          [week]
+        ),
+        dbAll(
+          `SELECT u.username AS username, COUNT(*) AS n
+           FROM matches m JOIN users u ON u.id = m.userId
+           WHERE u.createdAt >= ? AND m.timestamp >= ?
+           GROUP BY u.id HAVING COUNT(*) >= 40 ORDER BY n DESC LIMIT 10`,
+          [now - day, now - day]
+        )
+      ]);
+
+    const today = Math.floor(now / day);
+    const byDay = {};
+    daily.forEach((r) => {
+      byDay[r.d] = r.n;
+    });
+    const dailyVotes = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = today - i;
+      dailyVotes.push({ day: new Date(d * day).toUTCString().slice(0, 3), votes: byDay[d] || 0 });
+    }
+
+    res.json({
+      users: users.n,
+      newUsers7d: users7.n,
+      photos: photos.n,
+      newPhotos7d: photos7.n,
+      votes: votes.n,
+      votes24h: votes24.n,
+      votes7d: votes7.n,
+      activeVoters7d: voters7.n,
+      openReports: reports.n,
+      referredSignups: referred.n,
+      topReferrers: refTop,
+      dailyVotes,
+      possibleBoosting: boosting,
+      newAccountHeavyVoting: newHeavy
+    });
+  } catch (err) {
+    console.error('Analytics error:', err);
+    res.status(500).json({ error: 'Could not load analytics' });
+  }
+});
+
+app.post('/api/admin/users/:username/ban', verifyToken, requireAdmin, (req, res) => {
+  db.get(`SELECT id, email FROM users WHERE LOWER(username) = LOWER(?)`, [req.params.username], (err, u) => {
+    if (err || !u) return res.status(404).json({ error: 'User not found' });
+    if (isAdminEmail(u.email)) return res.status(400).json({ error: 'You cannot ban an admin' });
+
+    db.run(`UPDATE users SET banned = 1 WHERE id = ?`, [u.id], () => {
+      db.all(`SELECT id FROM photos WHERE userId = ?`, [u.id], (e2, list) => {
+        (list || []).forEach((p) => deletePhotoCompletely(p.id));
+        res.json({ success: true });
+      });
+    });
+  });
+});
+
 // ==================== DELETE / REPORT / ADMIN ====================
 
 // Delete my own photo
@@ -926,7 +1329,7 @@ app.post('/api/photos/:photoId/report', verifyToken, (req, res) => {
 // Admin: list photos with open reports
 app.get('/api/admin/reports', verifyToken, requireAdmin, (req, res) => {
   db.all(
-    `SELECT p.id AS photoId, p.title, p.imageUrl, u.displayName AS uploaderName, u.email AS uploaderEmail,
+    `SELECT p.id AS photoId, p.title, p.imageUrl, u.displayName AS uploaderName, u.username AS uploaderUsername, u.email AS uploaderEmail,
             COUNT(r.id) AS reportCount
      FROM reports r
      JOIN photos p ON p.id = r.photoId
@@ -967,117 +1370,62 @@ app.delete('/api/admin/photos/:photoId', verifyToken, requireAdmin, (req, res) =
 // ==================== LEADERBOARD ====================
 
 app.get('/api/leaderboard', (req, res) => {
+  const category = CATEGORIES[req.query.category] ? req.query.category : null;
+  const scope = req.query.scope;
+  const hidden = `(SELECT COUNT(*) FROM reports r WHERE r.photoId = p.id AND r.status = 'open') < ${HIDE_AFTER_REPORTS}`;
+  const catCond = category ? `AND COALESCE(p.category, 'selfies') = ?` : '';
+
+  // Recent winners: ranked by votes received in a time window (this week / this month)
+  if (scope === 'week' || scope === 'season') {
+    const now = new Date();
+    const since = scope === 'week'
+      ? Date.now() - 7 * 24 * 60 * 60 * 1000
+      : Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+    const params = [since];
+    if (category) params.push(category);
+
+    return db.all(
+      `SELECT p.id, p.title, p.imageUrl, p.rating, p.category, u.displayName, u.username, u.profileImage,
+              SUM(CASE WHEN m.winnerId = p.id THEN 1 ELSE 0 END) AS wins, COUNT(*) AS battles
+       FROM matches m
+       JOIN photos p ON (p.id = m.photoAId OR p.id = m.photoBId)
+       JOIN users u ON u.id = p.userId
+       WHERE m.timestamp >= ? AND ${hidden} ${catCond}
+       GROUP BY p.id
+       ORDER BY wins DESC, (SUM(CASE WHEN m.winnerId = p.id THEN 1 ELSE 0 END) * 1.0 / COUNT(*)) DESC
+       LIMIT 100`,
+      params,
+      (err, rows) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        res.json((rows || []).map((p, idx) => ({
+          ...p,
+          rank: idx + 1,
+          matchesPlayed: p.battles,
+          losses: p.battles - p.wins,
+          winRate: ((p.wins / p.battles * 100) || 0).toFixed(1),
+          provisional: false
+        })));
+      }
+    );
+  }
+
+  // All-time: ranked by rating
   db.all(
-    `SELECT p.*, u.displayName, u.profileImage, u.username 
-     FROM photos p 
-     JOIN users u ON p.userId = u.id 
-     WHERE p.matchesPlayed >= 1 
-       AND (SELECT COUNT(*) FROM reports r WHERE r.photoId = p.id AND r.status = 'open') < ${HIDE_AFTER_REPORTS} 
-     ORDER BY p.rating DESC, p.matchesPlayed DESC 
+    `SELECT p.*, u.displayName, u.profileImage, u.username
+     FROM photos p
+     JOIN users u ON p.userId = u.id
+     WHERE p.matchesPlayed >= 1 AND ${hidden} ${catCond}
+     ORDER BY p.rating DESC, p.matchesPlayed DESC
      LIMIT 100`,
+    category ? [category] : [],
     (err, photos) => {
       if (err) return res.status(500).json({ error: 'Database error' });
-
-      const leaderboard = photos.map((p, idx) => ({
+      res.json((photos || []).map((p, idx) => ({
         rank: idx + 1,
         ...p,
+        provisional: p.matchesPlayed < 5,
         winRate: ((p.wins / p.matchesPlayed * 100) || 0).toFixed(1)
-      }));
-
-      res.json(leaderboard);
-    }
-  );
-});
-
-// Get photo with user details
-app.get('/api/photos/:photoId', (req, res) => {
-  db.get(
-    `SELECT p.*, u.displayName, u.profileImage, u.username, u.bio 
-     FROM photos p 
-     JOIN users u ON p.userId = u.id 
-     WHERE p.id = ?`,
-    [req.params.photoId],
-    (err, photo) => {
-      if (err || !photo) return res.status(404).json({ error: 'Photo not found' });
-
-      const winRate = photo.matchesPlayed > 0 
-        ? ((photo.wins / photo.matchesPlayed * 100).toFixed(1))
-        : 0;
-
-      res.json({ ...photo, winRate });
-    }
-  );
-});
-
-// ==================== USER PROFILE ====================
-
-app.get('/api/users/:userId', (req, res) => {
-  db.get(
-    `SELECT id, username, displayName, bio, profileImage, createdAt FROM users WHERE id = ?`,
-    [req.params.userId],
-    (err, user) => {
-      if (err || !user) return res.status(404).json({ error: 'User not found' });
-
-      // Get user's photos stats
-      db.all(
-        `SELECT COUNT(*) as totalPhotos, AVG(rating) as avgRating, SUM(wins) as totalWins 
-         FROM photos WHERE userId = ?`,
-        [req.params.userId],
-        (err, stats) => {
-          res.json({
-            ...user,
-            totalPhotos: stats[0]?.totalPhotos || 0,
-            avgRating: stats[0]?.avgRating ? Math.round(stats[0].avgRating) : 0,
-            totalWins: stats[0]?.totalWins || 0
-          });
-        }
-      );
-    }
-  );
-});
-
-// Update profile (bio, display name)
-app.put('/api/profile', verifyToken, (req, res) => {
-  const { displayName, bio, username } = req.body;
-  const now = Date.now();
-
-  const saveProfile = (newUsername) => {
-    const fields = ['displayName = ?', 'bio = ?', 'updatedAt = ?'];
-    const values = [displayName || '', bio || '', now];
-    if (newUsername) {
-      fields.push('username = ?');
-      values.push(newUsername);
-    }
-    values.push(req.userId);
-
-    db.run(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, values, (err) => {
-      if (err) {
-        if (String(err.message).includes('UNIQUE')) {
-          return res.status(409).json({ error: 'That username is already taken' });
-        }
-        return res.status(500).json({ error: 'Update failed' });
-      }
-      res.json({ success: true, username: newUsername || undefined });
-    });
-  };
-
-  if (!username) return saveProfile(null);
-
-  const wanted = String(username).trim().replace(/^@/, '');
-  if (!USERNAME_RE.test(wanted)) {
-    return res.status(400).json({ error: 'Username must be 3-20 letters, numbers or underscores' });
-  }
-  if (RESERVED_USERNAMES.includes(wanted.toLowerCase())) {
-    return res.status(400).json({ error: 'That username is not available' });
-  }
-
-  db.get(
-    `SELECT id FROM users WHERE LOWER(username) = LOWER(?) AND id != ?`,
-    [wanted, req.userId],
-    (err, taken) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      if (taken) return res.status(409).json({ error: 'That username is already taken' });
-      saveProfile(wanted);
+      })));
     }
   );
 });
