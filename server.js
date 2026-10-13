@@ -916,24 +916,35 @@ app.get('/api/achievements', verifyToken, (req, res) => {
 
 // Choose one of your own uploaded photos as your profile picture (or clear it)
 app.put('/api/profile/picture', verifyToken, (req, res) => {
-  const { photoId } = req.body;
+  const { photoId, imageUrl } = req.body;
   const now = Date.now();
 
-  if (!photoId) {
-    return db.run(`UPDATE users SET profileImage = NULL, updatedAt = ? WHERE id = ?`, [now, req.userId], (err) => {
-      if (err) return res.status(500).json({ error: 'Update failed' });
-      res.json({ success: true, profileImage: null });
+  const save = (url) => {
+    db.run(`UPDATE users SET profileImage = ?, updatedAt = ? WHERE id = ?`, [url, now, req.userId], (err) => {
+      if (err) {
+        console.error('Profile picture error:', err.message);
+        return res.status(500).json({ error: 'Update failed', detail: String(err.message).slice(0, 120) });
+      }
+      res.json({ success: true, profileImage: url });
     });
+  };
+
+  // Direct upload from the phone (stored on Cloudinary)
+  if (imageUrl) {
+    if (typeof imageUrl !== 'string' || !imageUrl.startsWith('https://res.cloudinary.com/')) {
+      return res.status(400).json({ error: 'That image link is not allowed' });
+    }
+    return save(imageUrl);
   }
 
+  // Clear the picture (letter avatar)
+  if (!photoId) return save(null);
+
+  // One of your own uploaded photos
   db.get(`SELECT imageUrl FROM photos WHERE id = ? AND userId = ?`, [photoId, req.userId], (err, photo) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!photo) return res.status(404).json({ error: 'Choose one of your own photos' });
-
-    db.run(`UPDATE users SET profileImage = ?, updatedAt = ? WHERE id = ?`, [photo.imageUrl, now, req.userId], (err2) => {
-      if (err2) return res.status(500).json({ error: 'Update failed' });
-      res.json({ success: true, profileImage: photo.imageUrl });
-    });
+    save(photo.imageUrl);
   });
 });
 
@@ -1429,6 +1440,101 @@ app.get('/api/leaderboard', (req, res) => {
     }
   );
 });
+
+// ==================== PHOTO + USER PROFILE ====================
+
+app.get('/api/photos/:photoId', (req, res) => {
+  db.get(
+    `SELECT p.*, u.displayName, u.profileImage, u.username, u.bio 
+     FROM photos p 
+     JOIN users u ON p.userId = u.id 
+     WHERE p.id = ?`,
+    [req.params.photoId],
+    (err, photo) => {
+      if (err || !photo) return res.status(404).json({ error: 'Photo not found' });
+
+      const winRate = photo.matchesPlayed > 0 
+        ? ((photo.wins / photo.matchesPlayed * 100).toFixed(1))
+        : 0;
+
+      res.json({ ...photo, winRate });
+    }
+  );
+});
+
+app.get('/api/users/:userId', (req, res) => {
+  db.get(
+    `SELECT id, username, displayName, bio, profileImage, createdAt FROM users WHERE id = ?`,
+    [req.params.userId],
+    (err, user) => {
+      if (err || !user) return res.status(404).json({ error: 'User not found' });
+
+      db.all(
+        `SELECT COUNT(*) as totalPhotos, AVG(rating) as avgRating, SUM(wins) as totalWins 
+         FROM photos WHERE userId = ?`,
+        [req.params.userId],
+        (err2, stats) => {
+          res.json({
+            ...user,
+            totalPhotos: stats?.[0]?.totalPhotos || 0,
+            avgRating: stats?.[0]?.avgRating ? Math.round(stats[0].avgRating) : 0,
+            totalWins: stats?.[0]?.totalWins || 0
+          });
+        }
+      );
+    }
+  );
+});
+
+// Update profile (display name, bio, username)
+app.put('/api/profile', verifyToken, (req, res) => {
+  const { displayName, bio, username } = req.body;
+  const now = Date.now();
+
+  const saveProfile = (newUsername) => {
+    const fields = ['displayName = ?', 'bio = ?', 'updatedAt = ?'];
+    const values = [displayName || '', bio || '', now];
+    if (newUsername) {
+      fields.push('username = ?');
+      values.push(newUsername);
+    }
+    values.push(req.userId);
+
+    db.run(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, values, (err) => {
+      if (err) {
+        if (String(err.message).includes('UNIQUE')) {
+          return res.status(409).json({ error: 'That username is already taken' });
+        }
+        console.error('Profile update error:', err.message);
+        return res.status(500).json({ error: 'Update failed', detail: String(err.message).slice(0, 120) });
+      }
+      res.json({ success: true, username: newUsername || undefined });
+    });
+  };
+
+  if (!username) return saveProfile(null);
+
+  const wanted = String(username).trim().replace(/^@/, '');
+  if (!USERNAME_RE.test(wanted)) {
+    return res.status(400).json({ error: 'Username must be 3-20 letters, numbers or underscores' });
+  }
+  if (RESERVED_USERNAMES.includes(wanted.toLowerCase())) {
+    return res.status(400).json({ error: 'That username is not available' });
+  }
+
+  db.get(
+    `SELECT id FROM users WHERE LOWER(username) = LOWER(?) AND id != ?`,
+    [wanted, req.userId],
+    (err, taken) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (taken) return res.status(409).json({ error: 'That username is already taken' });
+      saveProfile(wanted);
+    }
+  );
+});
+
+// Tiny health check (used by an uptime pinger to keep the free server awake)
+app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 // ==================== STATS ====================
 
