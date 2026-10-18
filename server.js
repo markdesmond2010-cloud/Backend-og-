@@ -122,6 +122,41 @@ function initializeDatabase() {
       )
     `);
 
+    // Engagement: Clout points, activity tracking, notifications, push subscriptions
+    db.run(`ALTER TABLE users ADD COLUMN clout INTEGER DEFAULT 0`, [], () => {});
+    db.run(`ALTER TABLE users ADD COLUMN welcomed INTEGER DEFAULT 0`, [], () => {});
+    db.run(`ALTER TABLE users ADD COLUMN lastActiveAt INTEGER`, [], () => {});
+    db.run(`ALTER TABLE users ADD COLUMN lastReminderAt INTEGER`, [], () => {});
+    db.run(`ALTER TABLE users ADD COLUMN reminderStreak INTEGER DEFAULT 0`, [], () => {});
+    db.run(`ALTER TABLE users ADD COLUMN achievementsSeen TEXT`, [], () => {});
+    db.run(`ALTER TABLE users ADD COLUMN tierSeen TEXT`, [], () => {});
+
+    db.run(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id TEXT PRIMARY KEY,
+        userId TEXT NOT NULL,
+        type TEXT,
+        text TEXT,
+        link TEXT,
+        ref TEXT,
+        count INTEGER DEFAULT 1,
+        createdAt INTEGER,
+        readAt INTEGER
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(userId, createdAt)`, [], () => {});
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_notif_welcome ON notifications(userId) WHERE type = 'welcome'`, [], () => {});
+
+    db.run(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        endpoint TEXT PRIMARY KEY,
+        userId TEXT NOT NULL,
+        p256dh TEXT,
+        auth TEXT,
+        createdAt INTEGER
+      )
+    `);
+
     console.log('✅ Database tables initialized');
   });
 }
@@ -148,8 +183,12 @@ function verifyToken(req, res, next) {
   }
 
   req.userId = decoded.userId;
-  db.get(`SELECT banned FROM users WHERE id = ?`, [req.userId], (err, row) => {
+  db.get(`SELECT banned, lastActiveAt FROM users WHERE id = ?`, [req.userId], (err, row) => {
     if (row && row.banned) return res.status(403).json({ error: 'This account has been suspended' });
+    // Remember when someone was last active (at most once every 10 minutes)
+    if (row && (!row.lastActiveAt || Date.now() - row.lastActiveAt > 10 * 60 * 1000)) {
+      db.run(`UPDATE users SET lastActiveAt = ?, reminderStreak = 0 WHERE id = ?`, [Date.now(), req.userId]);
+    }
     next();
   });
 }
@@ -428,6 +467,142 @@ function addBattleCounts(rows, cb) {
   });
 }
 
+// ---- Web push (optional: needs the web-push package and VAPID keys in the environment) ----
+let webpush = null;
+try {
+  webpush = require('web-push');
+} catch (e) {
+  console.log('ℹ️ web-push is not installed, push notifications are off');
+}
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY;
+if (webpush && VAPID_PUBLIC && VAPID_PRIVATE) {
+  try {
+    webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com', VAPID_PUBLIC, VAPID_PRIVATE);
+  } catch (e) {
+    console.error('Push setup failed:', e.message);
+    webpush = null;
+  }
+}
+const pushEnabled = () => !!(webpush && VAPID_PUBLIC && VAPID_PRIVATE);
+
+function sendPush(userId, payload) {
+  if (!pushEnabled()) return;
+  db.all(`SELECT * FROM push_subscriptions WHERE userId = ?`, [userId], (err, subs) => {
+    (subs || []).forEach((sub) => {
+      webpush
+        .sendNotification(
+          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+          JSON.stringify(payload)
+        )
+        .catch((e) => {
+          // The phone removed this subscription
+          if (e && (e.statusCode === 404 || e.statusCode === 410)) {
+            db.run(`DELETE FROM push_subscriptions WHERE endpoint = ?`, [sub.endpoint]);
+          }
+        });
+    });
+  });
+}
+
+const dbRun = (sql, params = []) => new Promise((resolve, reject) => db.run(sql, params, (e) => (e ? reject(e) : resolve())));
+
+// ---- Clout points ----
+const WELCOME_CLOUT = 500;
+function awardClout(userId, amount) {
+  db.run(`UPDATE users SET clout = COALESCE(clout, 0) + ? WHERE id = ?`, [amount, userId]);
+}
+
+// ---- Notifications (the red dots) ----
+function notifyUser(userId, { type, text, link, push }, cb) {
+  db.run(
+    `INSERT INTO notifications (id, userId, type, text, link, createdAt) VALUES (?, ?, ?, ?, ?, ?)`,
+    [uuidv4(), userId, type, text, link || null, Date.now()],
+    () => {
+      if (push) sendPush(userId, { title: 'DUEL', body: text, url: link || '/' });
+      if (cb) cb();
+    }
+  );
+}
+
+// Votes on the same photo are grouped into one notification
+function notifyVote(ownerId, photoId, title) {
+  db.get(
+    `SELECT id, count FROM notifications WHERE userId = ? AND type = 'votes' AND ref = ? AND readAt IS NULL`,
+    [ownerId, photoId],
+    (e, row) => {
+      const t = String(title || 'your photo').slice(0, 40);
+      if (row) {
+        const n = (row.count || 1) + 1;
+        db.run(`UPDATE notifications SET count = ?, text = ?, createdAt = ? WHERE id = ?`, [
+          n,
+          `🗳️ "${t}" got ${n} new votes`,
+          Date.now(),
+          row.id
+        ]);
+      } else {
+        db.run(
+          `INSERT INTO notifications (id, userId, type, text, link, ref, count, createdAt) VALUES (?, ?, 'votes', ?, ?, ?, 1, ?)`,
+          [uuidv4(), ownerId, `🗳️ "${t}" got a new vote`, '/?go=profile', photoId, Date.now()]
+        );
+      }
+    }
+  );
+}
+
+// First-time welcome: Clout bonus + a notification, and seed the "already earned" lists
+function giveWelcome(userId, cb) {
+  userStats(userId, (st) => {
+    const earnedIds = buildAchievements(st).filter((a) => a.earned).map((a) => a.id);
+    db.run(
+      `UPDATE users SET welcomed = 1, clout = COALESCE(clout, 0) + ?, achievementsSeen = ?, tierSeen = ?
+       WHERE id = ? AND COALESCE(welcomed, 0) = 0`,
+      [WELCOME_CLOUT, JSON.stringify(earnedIds), tierFor(st.wins).name, userId],
+      () => {
+        db.run(
+          `INSERT OR IGNORE INTO notifications (id, userId, type, text, link, createdAt) VALUES (?, ?, 'welcome', ?, ?, ?)`,
+          [uuidv4(), userId, `🎉 Welcome, Contender! You start with ${WELCOME_CLOUT} Clout. Vote, upload and duel to earn more.`, '/?go=vote', Date.now()],
+          () => cb && cb()
+        );
+      }
+    );
+  });
+}
+
+// Announce new achievements and tier-ups (and pay Clout for achievements)
+function checkProgress(userId) {
+  userStats(userId, (st) => {
+    db.get(`SELECT achievementsSeen, tierSeen FROM users WHERE id = ?`, [userId], (e, row) => {
+      if (!row) return;
+      const earned = buildAchievements(st).filter((a) => a.earned);
+      const tier = tierFor(st.wins);
+      let seen = null;
+      try {
+        seen = row.achievementsSeen ? JSON.parse(row.achievementsSeen) : null;
+      } catch (err) {}
+
+      if (seen) {
+        earned
+          .filter((a) => !seen.includes(a.id))
+          .forEach((a) => {
+            awardClout(userId, 25);
+            notifyUser(userId, { type: 'achievement', text: `🏅 Achievement unlocked: ${a.name}! +25 Clout`, link: '/?go=profile', push: true });
+          });
+        const oldIdx = TIERS.findIndex((t) => t.name === row.tierSeen);
+        const newIdx = TIERS.findIndex((t) => t.name === tier.name);
+        if (oldIdx >= 0 && newIdx > oldIdx) {
+          notifyUser(userId, { type: 'tier', text: `${tier.emoji} You reached ${tier.name} tier!`, link: '/?go=profile', push: true });
+        }
+      }
+      db.run(`UPDATE users SET achievementsSeen = ?, tierSeen = ? WHERE id = ?`, [
+        JSON.stringify(earned.map((a) => a.id)),
+        tier.name,
+        userId
+      ]);
+    });
+  });
+}
+
 // A photo with this many open reports is hidden until an admin reviews it
 const HIDE_AFTER_REPORTS = 3;
 
@@ -461,6 +636,8 @@ app.post('/api/auth/signup', authLimiter, signupLimiter, async (req, res) => {
         resolveReferrer(ref, (referrerId) => {
           if (referrerId && referrerId !== userId) {
             db.run(`UPDATE users SET invitedBy = ? WHERE id = ?`, [referrerId, userId]);
+            awardClout(referrerId, 100);
+            notifyUser(referrerId, { type: 'invite', text: `👋 @${username} joined with your link! +100 Clout`, link: '/?go=profile', push: true });
           }
         });
 
@@ -597,6 +774,8 @@ app.post('/api/auth/google-callback', async (req, res) => {
             resolveReferrer(ref, (referrerId) => {
               if (referrerId && referrerId !== userId) {
                 db.run(`UPDATE users SET invitedBy = ? WHERE id = ?`, [referrerId, userId]);
+            awardClout(referrerId, 100);
+            notifyUser(referrerId, { type: 'invite', text: `👋 @${username} joined with your link! +100 Clout`, link: '/?go=profile', push: true });
               }
             });
 
@@ -632,11 +811,22 @@ app.get('/api/auth/me', verifyToken, (req, res) => {
       if (err || !user) return res.status(404).json({ error: 'User not found' });
       db.get(`SELECT COUNT(*) AS n FROM users WHERE invitedBy = ?`, [req.userId], (err2, row) => {
         db.get(`SELECT COUNT(*) AS n FROM challenges WHERE toUserId = ? AND status = 'pending'`, [req.userId], (err3, ch) => {
-          res.json({
-            ...user,
-            isAdmin: isAdminEmail(user.email),
-            invitedCount: row?.n || 0,
-            pendingChallenges: ch?.n || 0
+          db.get(`SELECT COALESCE(clout, 0) AS clout, COALESCE(welcomed, 0) AS welcomed FROM users WHERE id = ?`, [req.userId], (err4, x) => {
+            const finish = (clout, welcomeBonus) => {
+              db.get(`SELECT COUNT(*) AS n FROM notifications WHERE userId = ? AND readAt IS NULL`, [req.userId], (err5, un) => {
+                res.json({
+                  ...user,
+                  isAdmin: isAdminEmail(user.email),
+                  invitedCount: row?.n || 0,
+                  pendingChallenges: ch?.n || 0,
+                  clout,
+                  unreadNotifications: un?.n || 0,
+                  welcomeBonus
+                });
+              });
+            };
+            if (x && !x.welcomed) giveWelcome(req.userId, () => finish(x.clout + WELCOME_CLOUT, WELCOME_CLOUT));
+            else finish(x ? x.clout : 0, 0);
           });
         });
       });
@@ -649,10 +839,13 @@ app.get('/api/auth/me', verifyToken, (req, res) => {
 // Upload photo (to Cloudinary - handled by frontend)
 app.post('/api/photos/upload', verifyToken, uploadLimiter, (req, res) => {
   const { title, imageUrl, cloudinaryId } = req.body;
-  const category = CATEGORIES[req.body.category] ? req.body.category : 'selfies';
+  const category = req.body.category;
 
   if (!title || !imageUrl) {
     return res.status(400).json({ error: 'Title and image required' });
+  }
+  if (!CATEGORIES[category]) {
+    return res.status(400).json({ error: 'Please choose a category' });
   }
 
   db.get(`SELECT COUNT(*) AS n FROM photos WHERE userId = ?`, [req.userId], (e, row) => {
@@ -670,7 +863,11 @@ app.post('/api/photos/upload', verifyToken, uploadLimiter, (req, res) => {
       (err) => {
         if (err) return res.status(500).json({ error: 'Upload failed' });
 
+        const first = !!row && row.n === 0;
+        if (first) awardClout(req.userId, 100); // first upload bonus
+
         res.json({
+          cloutEarned: first ? 100 : 0,
           id: photoId,
           userId: req.userId,
           title,
@@ -846,13 +1043,45 @@ app.post('/api/matchup/vote', verifyToken, (req, res) => {
                  WHERE (photoAId = ? AND photoBId = ?) OR (photoAId = ? AND photoBId = ?)`,
                 [winnerId, photoAId, photoBId, photoBId, photoAId],
                 (err5, pair) => {
-                  res.json({
-                    matchId,
-                    winner: winnerId,
-                    photoARating: Math.round(newRatingA),
-                    photoBRating: Math.round(newRatingB),
-                    pairVotes: { total: pair?.total || 1, winnerVotes: pair?.winnerVotes || 1 }
-                  });
+                  const winnerPhoto = winnerId === photoAId ? photoA : photoB;
+                  let cloutEarned = 5;
+                  awardClout(req.userId, 5); // for voting
+                  awardClout(winnerPhoto.userId, 2); // for receiving a vote
+                  notifyVote(winnerPhoto.userId, winnerPhoto.id, winnerPhoto.title);
+                  checkProgress(winnerPhoto.userId);
+
+                  const respond = (dailyComplete) => {
+                    res.json({
+                      matchId,
+                      winner: winnerId,
+                      photoARating: Math.round(newRatingA),
+                      photoBRating: Math.round(newRatingB),
+                      pairVotes: { total: pair?.total || 1, winnerVotes: pair?.winnerVotes || 1 },
+                      cloutEarned,
+                      dailyComplete
+                    });
+                  };
+
+                  // Daily challenge: 10 votes in today's featured category
+                  const day = Math.floor(Date.now() / 86400000);
+                  const keys = Object.keys(CATEGORIES);
+                  const featured = keys[day % keys.length];
+                  if ((winnerPhoto.category || 'selfies') !== featured) return respond(false);
+
+                  db.get(
+                    `SELECT COUNT(*) AS n FROM matches m JOIN photos p ON p.id = m.winnerId
+                     WHERE m.userId = ? AND m.timestamp >= ? AND COALESCE(p.category, 'selfies') = ?`,
+                    [req.userId, day * 86400000, featured],
+                    (err6, d) => {
+                      if (d && d.n === 10) {
+                        awardClout(req.userId, 50);
+                        cloutEarned += 50;
+                        notifyUser(req.userId, { type: 'daily', text: '✅ Daily challenge complete! +50 Clout', link: '/?go=vote' });
+                        return respond(true);
+                      }
+                      respond(false);
+                    }
+                  );
                 }
               );
             }
@@ -1125,6 +1354,14 @@ app.post('/api/challenges', verifyToken, challengeLimiter, (req, res) => {
             [id, req.userId, target.id, photoId, Date.now()],
             (e4) => {
               if (e4) return res.status(500).json({ error: 'Could not send the challenge' });
+              db.get(`SELECT username FROM users WHERE id = ?`, [req.userId], (e5, me) => {
+                notifyUser(target.id, {
+                  type: 'challenge',
+                  text: `⚔️ @${me?.username || 'Someone'} challenged you to a duel`,
+                  link: '/?go=profile',
+                  push: true
+                });
+              });
               res.json({ success: true, id });
             }
           );
@@ -1163,6 +1400,14 @@ app.post('/api/challenges/:id/accept', verifyToken, (req, res) => {
         [photoId, now, now + 3 * 86400000, c.id],
         (e3) => {
           if (e3) return res.status(500).json({ error: 'Could not accept' });
+          db.get(`SELECT username FROM users WHERE id = ?`, [req.userId], (e4, me) => {
+            notifyUser(c.fromUserId, {
+              type: 'challenge_accepted',
+              text: `✅ @${me?.username || 'Someone'} accepted your challenge. The battle is live!`,
+              link: `/b/${c.id}`,
+              push: true
+            });
+          });
           res.json({ success: true, id: c.id });
         }
       );
@@ -1539,6 +1784,106 @@ app.put('/api/profile', verifyToken, (req, res) => {
       saveProfile(wanted);
     }
   );
+});
+
+// ==================== NOTIFICATIONS + PUSH ====================
+
+app.get('/api/notifications', verifyToken, (req, res) => {
+  db.all(
+    `SELECT id, type, text, link, count, createdAt, readAt FROM notifications
+     WHERE userId = ? ORDER BY createdAt DESC LIMIT 30`,
+    [req.userId],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json(rows || []);
+    }
+  );
+});
+
+app.post('/api/notifications/read', verifyToken, (req, res) => {
+  db.run(`UPDATE notifications SET readAt = ? WHERE userId = ? AND readAt IS NULL`, [Date.now(), req.userId], () =>
+    res.json({ success: true })
+  );
+});
+
+app.get('/api/push/key', (req, res) => {
+  res.json({ publicKey: pushEnabled() ? VAPID_PUBLIC : null });
+});
+
+app.post('/api/push/subscribe', verifyToken, (req, res) => {
+  const sub = req.body.subscription;
+  if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) {
+    return res.status(400).json({ error: 'Invalid subscription' });
+  }
+  db.run(
+    `INSERT OR REPLACE INTO push_subscriptions (endpoint, userId, p256dh, auth, createdAt) VALUES (?, ?, ?, ?, ?)`,
+    [sub.endpoint, req.userId, sub.keys.p256dh, sub.keys.auth, Date.now()],
+    (err) => {
+      if (err) return res.status(500).json({ error: 'Could not save subscription' });
+      res.json({ success: true });
+    }
+  );
+});
+
+app.post('/api/push/unsubscribe', verifyToken, (req, res) => {
+  db.run(`DELETE FROM push_subscriptions WHERE endpoint = ? AND userId = ?`, [req.body.endpoint || '', req.userId], () =>
+    res.json({ success: true })
+  );
+});
+
+// A polite reminder for people who have been away (called on a schedule by cron-job.org)
+app.get('/api/cron/reminders', async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret || req.query.key !== secret) return res.status(403).json({ error: 'Forbidden' });
+  if (!pushEnabled()) return res.json({ sent: 0, note: 'push is not configured' });
+
+  // Only between 9am and 9pm local time (Lagos is UTC+1 by default)
+  const offset = Number(process.env.REMINDER_UTC_OFFSET ?? 1);
+  const localHour = (new Date().getUTCHours() + offset + 24) % 24;
+  if (localHour < 9 || localHour >= 21) return res.json({ sent: 0, note: 'quiet hours' });
+
+  try {
+    const now = Date.now();
+    const gap = 20 * 60 * 60 * 1000;
+    const users = await dbAll(
+      `SELECT u.id, COALESCE(u.reminderStreak, 0) AS streak, u.lastReminderAt,
+              (SELECT COUNT(*) FROM notifications n WHERE n.userId = u.id AND n.readAt IS NULL) AS unread
+       FROM users u
+       WHERE COALESCE(u.banned, 0) = 0
+         AND EXISTS (SELECT 1 FROM push_subscriptions s WHERE s.userId = u.id)
+         AND (u.lastActiveAt IS NULL OR u.lastActiveAt < ?)
+         AND (u.lastReminderAt IS NULL OR u.lastReminderAt < ?)
+       LIMIT 200`,
+      [now - gap, now - gap]
+    );
+
+    const day = Math.floor(now / 86400000);
+    const keys = Object.keys(CATEGORIES);
+    const featuredLabel = CATEGORIES[keys[day % keys.length]];
+    let sent = 0;
+
+    for (const u of users) {
+      // Stop nagging after 3 reminders in a row that were ignored (pause for a week)
+      if (u.streak >= 3 && u.lastReminderAt && now - u.lastReminderAt < 7 * 86400000) continue;
+
+      let body;
+      if (u.unread > 0) body = `👀 You have ${u.unread} new update${u.unread === 1 ? '' : 's'} on DUEL`;
+      else if (u.streak % 2 === 0) body = `🔥 Today's challenge: 10 quick ${featuredLabel} duels. Ready when you are!`;
+      else body = '📸 Your photos are waiting for votes. Come see how they are ranking!';
+
+      sendPush(u.id, { title: 'DUEL', body, url: '/?go=vote' });
+      await dbRun(`UPDATE users SET lastReminderAt = ?, reminderStreak = ? WHERE id = ?`, [
+        now,
+        u.streak >= 3 ? 1 : u.streak + 1,
+        u.id
+      ]);
+      sent += 1;
+    }
+    res.json({ sent });
+  } catch (err) {
+    console.error('Reminder error:', err);
+    res.status(500).json({ error: 'Reminder job failed' });
+  }
 });
 
 // Tiny health check (used by an uptime pinger to keep the free server awake)
