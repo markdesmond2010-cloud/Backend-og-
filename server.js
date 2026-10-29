@@ -11,6 +11,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const db = require('./db');
+const { updateElo, recalculateAllRatings, START_ELO } = require('./elo');
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 require('dotenv').config();
@@ -57,7 +58,7 @@ function initializeDatabase() {
         title TEXT NOT NULL,
         imageUrl TEXT NOT NULL,
         cloudinaryId TEXT,
-        rating REAL DEFAULT 1600,
+        rating REAL DEFAULT 1000,
         matchesPlayed INTEGER DEFAULT 0,
         wins INTEGER DEFAULT 0,
         losses INTEGER DEFAULT 0,
@@ -162,6 +163,11 @@ function initializeDatabase() {
 }
 
 initializeDatabase();
+
+// One time after this update: put every photo on the Facemash scale (start 1000, K = 32)
+recalculateAllRatings({ onlyOnce: true })
+  .then((r) => r && console.log(`🔁 Elo recalculated from past votes: ${r.photos} photos, ${r.matches} votes`))
+  .catch((e) => console.error('Elo recalculation failed:', e.message));
 
 // ==================== AUTHENTICATION ====================
 
@@ -857,9 +863,9 @@ app.post('/api/photos/upload', verifyToken, uploadLimiter, (req, res) => {
     const now = Date.now();
 
     db.run(
-      `INSERT INTO photos (id, userId, title, imageUrl, cloudinaryId, category, createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [photoId, req.userId, String(title).slice(0, 100), imageUrl, cloudinaryId, category, now, now],
+      `INSERT INTO photos (id, userId, title, imageUrl, cloudinaryId, category, rating, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [photoId, req.userId, String(title).slice(0, 100), imageUrl, cloudinaryId, category, START_ELO, now, now],
       (err) => {
         if (err) return res.status(500).json({ error: 'Upload failed' });
 
@@ -873,7 +879,7 @@ app.post('/api/photos/upload', verifyToken, uploadLimiter, (req, res) => {
           title,
           imageUrl,
           category,
-          rating: 1600,
+          rating: START_ELO,
           matchesPlayed: 0,
           wins: 0,
           losses: 0
@@ -1006,33 +1012,24 @@ app.post('/api/matchup/vote', verifyToken, (req, res) => {
             return res.status(409).json({ error: 'You already voted on this pair' });
           }
 
-          // Calculate Elo changes
-          const ea = 1 / (1 + Math.pow(10, (photoB.rating - photoA.rating) / 400));
-          const eb = 1 - ea;
-          // New photos move faster so they find their level quickly (fairness for newcomers)
-          const kA = (photoA.matchesPlayed || 0) < 10 ? 40 : 20;
-          const kB = (photoB.matchesPlayed || 0) < 10 ? 40 : 20;
-          const resultA = winnerId === photoAId ? 1 : 0;
-          const deltaA = kA * (resultA - ea);
-          const deltaB = kB * ((1 - resultA) - eb);
-
-          const newRatingA = photoA.rating + deltaA;
-          const newRatingB = photoB.rating + deltaB;
+          const loserId = winnerId === photoAId ? photoBId : photoAId;
           const now = Date.now();
           const matchId = uuidv4();
 
-          // Update ratings
-          db.run(`UPDATE photos SET rating = ?, matchesPlayed = matchesPlayed + 1, wins = wins + ?, losses = losses + ?, updatedAt = ? WHERE id = ?`,
-            [newRatingA, resultA ? 1 : 0, resultA ? 0 : 1, now, photoAId]);
-
-          db.run(`UPDATE photos SET rating = ?, matchesPlayed = matchesPlayed + 1, wins = wins + ?, losses = losses + ?, updatedAt = ? WHERE id = ?`,
-            [newRatingB, resultA ? 0 : 1, resultA ? 1 : 0, now, photoBId]);
+          // Facemash-style Elo (see elo.js): updates both ratings plus wins/losses
+          updateElo(winnerId, loserId)
+            .then((elo) => {
+          const aIsWinner = winnerId === photoAId;
+          const a = aIsWinner ? elo.winner : elo.loser;
+          const b = aIsWinner ? elo.loser : elo.winner;
+          const newRatingA = a.after;
+          const newRatingB = b.after;
 
           // Record match
           db.run(
             `INSERT INTO matches (id, photoAId, photoBId, winnerId, userId, ratingABefore, ratingBBefore, ratingAAfter, ratingBAfter, deltaA, deltaB, timestamp)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [matchId, photoAId, photoBId, winnerId, req.userId, photoA.rating, photoB.rating, newRatingA, newRatingB, deltaA, deltaB, now],
+            [matchId, photoAId, photoBId, winnerId, req.userId, a.before, b.before, a.after, b.after, a.delta, b.delta, now],
             (err4) => {
               if (err4) return res.status(500).json({ error: 'Vote failed' });
 
@@ -1086,6 +1083,11 @@ app.post('/api/matchup/vote', verifyToken, (req, res) => {
               );
             }
           );
+            })
+            .catch((e) => {
+              console.error('Elo update failed:', e.message);
+              res.status(500).json({ error: 'Vote failed' });
+            });
         }
       );
     });
